@@ -44,11 +44,31 @@ except ImportError:
 
 from .. import __version__ as PACKAGE_VERSION
 from ..core.analyzer_factory import build_analyzers
+from ..core.exceptions import SkillLoadError
 from ..core.scan_policy import ScanPolicy
 from ..core.scanner import SkillScanner
-from ..telemetry import is_enabled
+from ..telemetry import is_enabled, record_scan_error
 
 logger = logging.getLogger("skill_scanner.api")
+
+
+def _add_span_event(name: str, attributes: dict[str, str]) -> None:
+    """Attach an event to the currently active span, if telemetry is enabled.
+
+    Used to make soft failures (caught exceptions that don't abort the request)
+    visible in traces. No-ops when telemetry is disabled.
+    """
+    if not is_enabled():
+        return
+    try:
+        from opentelemetry import trace as _otel_trace
+
+        span = _otel_trace.get_current_span()
+        if span is not None:
+            span.add_event(name, attributes)
+    except Exception:  # pragma: no cover - never break a request over telemetry
+        pass
+
 
 LLMAnalyzer: type | None
 try:
@@ -97,14 +117,20 @@ except (ImportError, ModuleNotFoundError):
 
 MetaAnalyzer: type | None
 apply_meta_analysis_to_results: Callable[..., list] | None
+merge_meta_analyzer_usage: Callable[..., None] | None
 try:
-    from ..core.analyzers.meta_analyzer import MetaAnalyzer, apply_meta_analysis_to_results
+    from ..core.analyzers.meta_analyzer import (
+        MetaAnalyzer,
+        apply_meta_analysis_to_results,
+        merge_meta_analyzer_usage,
+    )
 
     META_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     META_AVAILABLE = False
     MetaAnalyzer = None
     apply_meta_analysis_to_results = None
+    merge_meta_analyzer_usage = None
 
 router = APIRouter()
 
@@ -200,6 +226,7 @@ class ScanRequest(BaseModel):
     use_aidefense: bool = Field(False, description="Enable AI Defense analyzer")
     aidefense_api_url: str | None = Field(None, description="AI Defense API URL")
     use_trigger: bool = Field(False, description="Enable trigger specificity analysis")
+    use_osv: bool = Field(False, description="Enable OSV.dev dependency vulnerability scanning")
     enable_meta: bool = Field(False, description="Enable meta-analysis for false positive filtering")
     llm_consensus_runs: int = Field(1, description="Number of LLM consensus runs (majority vote)")
 
@@ -215,6 +242,7 @@ class ScanResponse(BaseModel):
     scan_duration_seconds: float
     timestamp: str
     findings: list[dict]
+    llm_usage: dict[str, int] | None = None
 
 
 class HealthResponse(BaseModel):
@@ -244,6 +272,7 @@ class BatchScanRequest(BaseModel):
     use_aidefense: bool = False
     aidefense_api_url: str | None = None
     use_trigger: bool = False
+    use_osv: bool = False
     enable_meta: bool = Field(False, description="Enable meta-analysis")
     llm_consensus_runs: int = Field(1, description="Number of LLM consensus runs (majority vote)")
 
@@ -270,6 +299,12 @@ def _resolve_policy(policy_str: str | None) -> ScanPolicy:
     raise ValueError(f"Unknown policy '{policy_str}'. Use a preset name or a path to a YAML file.")
 
 
+def _skill_load_error_detail(error: SkillLoadError, skill_dir: Path) -> str:
+    """Return client-safe validation detail for skill loading failures."""
+    detail = str(error).replace(str(skill_dir), "skill directory")
+    return f"Invalid skill package: {detail}"
+
+
 def _build_analyzers(
     policy: ScanPolicy,
     *,
@@ -284,6 +319,7 @@ def _build_analyzers(
     aidefense_api_key: str | None = None,
     aidefense_api_url: str | None = None,
     use_trigger: bool = False,
+    use_osv: bool = False,
     llm_consensus_runs: int = 1,
 ):
     """Build the analyzer list — delegates to the centralized factory."""
@@ -300,6 +336,7 @@ def _build_analyzers(
         aidefense_api_key=aidefense_api_key,
         aidefense_api_url=aidefense_api_url,
         use_trigger=use_trigger,
+        use_osv=use_osv,
         llm_consensus_runs=llm_consensus_runs,
     )
 
@@ -432,6 +469,7 @@ async def scan_skill(
                 aidefense_api_key=aidefense_api_key,
                 aidefense_api_url=request.aidefense_api_url,
                 use_trigger=request.use_trigger,
+                use_osv=request.use_osv,
                 llm_consensus_runs=request.llm_consensus_runs,
             )
             scanner = SkillScanner(analyzers=analyzers, policy=policy)
@@ -478,8 +516,20 @@ async def scan_skill(
                 )
                 result.findings = filtered_findings
                 result.analyzers_used.append("meta_analyzer")
+                if merge_meta_analyzer_usage is not None:
+                    merge_meta_analyzer_usage(result, meta_analyzer)
             except Exception as meta_error:
                 logger.warning("Meta-analysis failed: %s", meta_error)
+                # Review item C: this soft failure was previously invisible in traces.
+                _add_span_event(
+                    "meta_analysis_failed",
+                    {"skill.directory": str(skill_dir), "error": str(meta_error)},
+                )
+                record_scan_error(
+                    skill_directory=str(skill_dir),
+                    error_type="meta_analysis_error",
+                    reason=str(meta_error),
+                )
 
         scan_id = str(uuid.uuid4())
         return ScanResponse(
@@ -491,8 +541,11 @@ async def scan_skill(
             scan_duration_seconds=result.scan_duration_seconds,
             timestamp=result.timestamp.isoformat(),
             findings=[f.to_dict() for f in result.findings],
+            llm_usage=result.llm_usage,
         )
 
+    except SkillLoadError as e:
+        raise HTTPException(status_code=422, detail=_skill_load_error_detail(e, skill_dir)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -515,6 +568,7 @@ async def scan_uploaded_skill(
     aidefense_api_key: str | None = Header(None, alias="X-AIDefense-Key"),
     aidefense_api_url: str | None = Form(None, description="AI Defense API URL"),
     use_trigger: bool = Form(False, description="Enable trigger specificity analysis"),
+    use_osv: bool = Form(False, description="Enable OSV.dev dependency vulnerability scanning"),
     enable_meta: bool = Form(False, description="Enable meta-analysis for FP filtering"),
     llm_consensus_runs: int = Form(1, description="Number of LLM consensus runs"),
 ):
@@ -608,6 +662,7 @@ async def scan_uploaded_skill(
             use_aidefense=use_aidefense,
             aidefense_api_url=aidefense_api_url,
             use_trigger=use_trigger,
+            use_osv=use_osv,
             enable_meta=enable_meta,
             llm_consensus_runs=llm_consensus_runs,
         )
@@ -714,6 +769,7 @@ def run_batch_scan(
             aidefense_api_key=aidefense_api_key,
             aidefense_api_url=request.aidefense_api_url,
             use_trigger=request.use_trigger,
+            use_osv=request.use_osv,
             llm_consensus_runs=request.llm_consensus_runs,
         )
 
@@ -752,13 +808,41 @@ def run_batch_scan(
                             )
                             result.findings = filtered_findings
                             result.analyzers_used.append("meta_analyzer")
-                        except Exception:
-                            pass
+                            if merge_meta_analyzer_usage is not None:
+                                merge_meta_analyzer_usage(result, meta_analyzer)
+                        # Review item C: this was a completely silent `pass`.
+                        except Exception as per_skill_error:
+                            logger.warning(
+                                "Batch meta-analysis failed for %s: %s",
+                                result.skill_directory,
+                                per_skill_error,
+                            )
+                            _add_span_event(
+                                "batch_meta_analysis_skill_failed",
+                                {
+                                    "skill.directory": str(result.skill_directory),
+                                    "error": str(per_skill_error),
+                                },
+                            )
+                            record_scan_error(
+                                skill_directory=str(result.skill_directory),
+                                error_type="meta_analysis_error",
+                                reason=str(per_skill_error),
+                            )
 
             try:
                 asyncio.run(_run_batch_meta(scanner, report, policy))
-            except Exception:
-                pass
+            except Exception as batch_meta_error:
+                logger.warning("Batch meta-analysis run failed: %s", batch_meta_error)
+                _add_span_event(
+                    "batch_meta_analysis_failed",
+                    {"error": str(batch_meta_error)},
+                )
+                record_scan_error(
+                    skill_directory=str(request.skills_directory),
+                    error_type="meta_analysis_error",
+                    reason=str(batch_meta_error),
+                )
 
         # Keep batch summary counters consistent with potentially mutated
         # per-skill findings (e.g., after meta-analysis filtering).

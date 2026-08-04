@@ -40,11 +40,14 @@ Install extras:
 
 from .telemetry import (
     TelemetryConfig,
+    external_span,
     get_logger,
     get_meter,
     get_tracer,
     is_enabled,
     record_analyzer_duration,
+    record_external_error,
+    record_external_retry,
     record_scan_error,
     record_scan_metrics,
     scan_span,
@@ -61,7 +64,10 @@ __all__ = [
     "setup_telemetry",
     "shutdown_telemetry",
     "scan_span",
+    "external_span",
     "record_scan_metrics",
     "record_analyzer_duration",
     "record_scan_error",
+    "record_external_retry",
+    "record_external_error",
 ]

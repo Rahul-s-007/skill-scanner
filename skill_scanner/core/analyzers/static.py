@@ -18,19 +18,28 @@
 Static pattern analyzer for detecting security vulnerabilities.
 """
 
+import ast
+import configparser
 import hashlib
 import logging
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from ...config.yara_modes import YaraModeConfig
 from ...core.models import Finding, Severity, Skill, ThreatCategory
 from ...core.rules.patterns import RuleLoader, SecurityRule
 from ...core.rules.yara_scanner import YaraScanner
 from ...core.scan_policy import ScanPolicy
+from ...core.static_analysis.url_classifier import classify_url, extract_urls
 from ...threats.threats import ThreatMapping
 from .base import BaseAnalyzer
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +301,8 @@ class StaticAnalyzer(BaseAnalyzer):
         2. Instruction body scanning (SKILL.md)
         3. Script/code scanning
         4. Consistency checks
-        5. Reference file scanning
+        5. Dependency pinning checks
+        6. Reference file scanning
 
         Args:
             skill: Skill to analyze
@@ -307,9 +317,12 @@ class StaticAnalyzer(BaseAnalyzer):
         findings.extend(self._scan_instruction_body(skill))
         findings.extend(self._scan_scripts(skill))
         findings.extend(self._check_consistency(skill))
+        findings.extend(self._check_dependency_pinning(skill))
+        findings.extend(self._scan_config_files(skill))
         findings.extend(self._scan_referenced_files(skill))
         findings.extend(self._check_binary_files(skill))
         findings.extend(self._check_hidden_files(skill))
+        findings.extend(self._check_ascii_smuggling(skill))
         findings.extend(self._check_file_inventory(skill))
         findings.extend(self._check_pdf_documents(skill))
         findings.extend(self._check_office_documents(skill))
@@ -581,6 +594,332 @@ class StaticAnalyzer(BaseAnalyzer):
             )
 
         return findings
+
+    # Lockfiles whose presence means dependency versions are already resolved/frozen.
+    _LOCKFILE_NAMES = {"uv.lock", "poetry.lock", "pipfile.lock", "requirements.lock"}
+
+    # name[extras] followed by an optional version specifier.
+    _REQUIREMENT_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(.*)$")
+    _SPECIFIER_RE = re.compile(r"^(===|==|~=|!=|<=|>=|<|>)\s*(.+)$")
+
+    @staticmethod
+    def _classify_requirement(raw: str) -> tuple[str, str] | None:
+        """Classify a single requirement line.
+
+        Returns ``(package_name, status)`` where ``status`` is one of
+        ``"pinned"`` (has an exact ``==`` version), ``"wildcard"`` (``==1.*``
+        style range pin), or ``"unpinned"`` (bare name or open range such as
+        ``>=``).  Returns ``None`` for lines that are not package requirements
+        (blank, comments, pip options like ``-r``/``--hash``, or direct
+        URL/VCS references which are already pinned to a specific artifact).
+        """
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            return None
+        # Drop PEP 508 environment markers (e.g. "; python_version < '3.11'").
+        line = line.split(";", 1)[0].strip()
+        # Direct URL / VCS / local-file references are pinned to an artifact.
+        if "://" in line or line.startswith("git+") or " @ " in line:
+            return None
+
+        match = StaticAnalyzer._REQUIREMENT_RE.match(line)
+        if not match:
+            return None
+        name = match.group(1)
+        spec = match.group(2).strip()
+        if not spec:
+            return (name, "unpinned")
+
+        has_exact = False
+        has_wildcard_pin = False
+        for part in (p.strip() for p in spec.split(",") if p.strip()):
+            op_match = StaticAnalyzer._SPECIFIER_RE.match(part)
+            if not op_match:
+                continue
+            operator, version = op_match.group(1), op_match.group(2).strip()
+            if operator in ("==", "==="):
+                if "*" in version:
+                    has_wildcard_pin = True
+                else:
+                    has_exact = True
+        if has_exact:
+            return (name, "pinned")
+        if has_wildcard_pin:
+            return (name, "wildcard")
+        return (name, "unpinned")
+
+    @staticmethod
+    def _first_line_containing(content: str, needle: str) -> int | None:
+        """Best-effort 1-based line number of the first line containing ``needle``."""
+        if not needle:
+            return None
+        for index, line in enumerate(content.splitlines(), start=1):
+            if needle in line:
+                return index
+        return None
+
+    @staticmethod
+    def _safe_toml(content: str) -> dict | None:
+        """Parse TOML, returning None when unavailable (py<3.11) or malformed."""
+        if tomllib is None:
+            return None
+        try:
+            return tomllib.loads(content)
+        except Exception:  # noqa: BLE001 - malformed manifest, treat as no data
+            return None
+
+    def _entries_from_pyproject(self, path: str, content: str) -> list[tuple[str, int | None, str]]:
+        """PEP 621 ``[project]`` dependencies and optional-dependencies."""
+        data = self._safe_toml(content)
+        project = data.get("project") if isinstance(data, dict) else None
+        if not isinstance(project, dict):
+            return []
+        specs: list[str] = []
+        deps = project.get("dependencies")
+        if isinstance(deps, list):
+            specs.extend(str(dep) for dep in deps)
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, dict):
+            for group in optional.values():
+                if isinstance(group, list):
+                    specs.extend(str(dep) for dep in group)
+        return [(path, self._first_line_containing(content, spec), spec) for spec in specs]
+
+    def _entries_from_setup_cfg(self, path: str, content: str) -> list[tuple[str, int | None, str]]:
+        """``[options] install_requires`` and ``[options.extras_require]``."""
+        parser = configparser.ConfigParser()
+        try:
+            parser.read_string(content)
+        except configparser.Error:
+            return []
+        blocks: list[str] = []
+        if parser.has_option("options", "install_requires"):
+            blocks.append(parser.get("options", "install_requires"))
+        if parser.has_section("options.extras_require"):
+            blocks.extend(value for _, value in parser.items("options.extras_require"))
+
+        entries: list[tuple[str, int | None, str]] = []
+        for block in blocks:
+            for piece in block.replace(",", "\n").splitlines():
+                spec = piece.strip()
+                if spec:
+                    entries.append((path, self._first_line_containing(content, spec), spec))
+        return entries
+
+    def _entries_from_setup_py(self, path: str, content: str) -> list[tuple[str, int | None, str]]:
+        """String literals inside ``install_requires=[...]`` in setup.py."""
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            return []
+        entries: list[tuple[str, int | None, str]] = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.keyword) and node.arg == "install_requires"):
+                continue
+            for literal in ast.walk(node.value):
+                if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
+                    line_number = getattr(literal, "lineno", None)
+                    entries.append((path, line_number, literal.value))
+        return entries
+
+    @staticmethod
+    def _pipfile_requirement(name: str, spec: Any) -> str | None:
+        """Convert a Pipfile entry into a requirement string, or None to skip."""
+        if isinstance(spec, str):
+            version = spec.strip()
+            return name if version in ("", "*") else f"{name}{version}"
+        if isinstance(spec, dict):
+            # git/path/url references are pinned to a specific artifact.
+            if any(key in spec for key in ("git", "path", "file", "url")):
+                return None
+            version = str(spec.get("version", "")).strip()
+            return name if version in ("", "*") else f"{name}{version}"
+        return None
+
+    def _entries_from_pipfile(self, path: str, content: str) -> list[tuple[str, int | None, str]]:
+        """``[packages]`` and ``[dev-packages]`` sections of a Pipfile (TOML)."""
+        data = self._safe_toml(content)
+        if not isinstance(data, dict):
+            return []
+        entries: list[tuple[str, int | None, str]] = []
+        for section in ("packages", "dev-packages"):
+            packages = data.get(section)
+            if not isinstance(packages, dict):
+                continue
+            for name, spec in packages.items():
+                requirement = self._pipfile_requirement(name, spec)
+                if requirement is not None:
+                    entries.append((path, self._first_line_containing(content, name), requirement))
+        return entries
+
+    def _collect_requirement_entries(self, skill: Skill) -> list[tuple[str, int | None, str]]:
+        """Gather ``(source_path, line_number, requirement_string)`` from every
+        dependency-declaring file in the skill plus manifest metadata."""
+        entries: list[tuple[str, int | None, str]] = []
+        for skill_file in skill.files:
+            file_name = Path(skill_file.relative_path).name.lower()
+            path = skill_file.relative_path
+            if file_name.startswith("requirements") and file_name.endswith(".txt"):
+                for line_number, raw in enumerate(skill_file.read_content().splitlines(), start=1):
+                    entries.append((path, line_number, raw))
+            elif file_name == "pyproject.toml":
+                entries.extend(self._entries_from_pyproject(path, skill_file.read_content()))
+            elif file_name == "setup.cfg":
+                entries.extend(self._entries_from_setup_cfg(path, skill_file.read_content()))
+            elif file_name == "setup.py":
+                entries.extend(self._entries_from_setup_py(path, skill_file.read_content()))
+            elif file_name == "pipfile":
+                entries.extend(self._entries_from_pipfile(path, skill_file.read_content()))
+
+        metadata = skill.manifest.metadata
+        if isinstance(metadata, dict):
+            declared = metadata.get("dependencies")
+            if isinstance(declared, list):
+                for declared_dep in declared:
+                    entries.append((str(skill.skill_md_path), None, str(declared_dep)))
+        return entries
+
+    def _check_dependency_pinning(self, skill: Skill) -> list[Finding]:
+        """Flag dependencies declared without an exact pinned version.
+
+        Skill packages are end-user applications, so unpinned dependencies
+        (``requests>=2`` or a bare ``requests``) let a later, potentially
+        compromised release be pulled in at install time -- a supply-chain
+        risk.  This differs from library pinning policy: libraries
+        intentionally use ranges, so if a lockfile is present the versions are
+        already frozen and we do not flag.
+
+        Sources checked: ``requirements*.txt``, ``pyproject.toml``
+        (``[project]`` dependencies and optional-dependencies), ``setup.cfg``,
+        ``setup.py`` (``install_requires``), ``Pipfile``, and a
+        ``dependencies`` list under manifest ``metadata``.
+        """
+        findings: list[Finding] = []
+
+        # A lockfile freezes the resolved versions, so ranges are intentional.
+        if any(Path(f.relative_path).name.lower() in self._LOCKFILE_NAMES for f in skill.files):
+            return findings
+
+        for source_label, line_number, raw in self._collect_requirement_entries(skill):
+            classified = self._classify_requirement(raw)
+            if classified is None:
+                continue
+            package_name, status = classified
+            if status == "pinned":
+                continue
+
+            severity = Severity.LOW if status == "wildcard" else Severity.MEDIUM
+            if status == "wildcard":
+                detail = f"'{package_name}' is pinned to a wildcard version range"
+            else:
+                detail = f"'{package_name}' has no pinned (==) version"
+            findings.append(
+                Finding(
+                    id=self._generate_finding_id(
+                        "SUPPLY_CHAIN_UNPINNED_DEPENDENCY", f"{source_label}:{line_number}:{package_name}"
+                    ),
+                    rule_id="SUPPLY_CHAIN_UNPINNED_DEPENDENCY",
+                    category=ThreatCategory.SUPPLY_CHAIN_ATTACK,
+                    severity=severity,
+                    title="Unpinned dependency",
+                    description=(
+                        f"Dependency {detail}. Unpinned dependencies in a skill package allow a later, "
+                        f"potentially malicious release to be installed automatically (supply-chain risk)."
+                    ),
+                    file_path=source_label,
+                    line_number=line_number,
+                    snippet=raw.strip() or None,
+                    remediation="Pin the dependency to an exact version (e.g. 'package==1.2.3').",
+                    analyzer="static",
+                )
+            )
+
+        return findings
+
+    # Basenames (without extension) treated as configuration files.
+    _CONFIG_FILE_STEMS = {"config", "settings"}
+
+    def _is_config_file(self, relative_path: str) -> bool:
+        """Return True for config files (config.*/settings.* YAML/JSON, any TOML)."""
+        name = Path(relative_path).name.lower()
+        suffix = Path(name).suffix
+        if suffix == ".toml":
+            return True
+        if suffix in (".yaml", ".yml", ".json"):
+            return Path(name).stem in self._CONFIG_FILE_STEMS
+        return False
+
+    def _scan_config_files(self, skill: Skill) -> list[Finding]:
+        """Classify URLs found in config files using the shared URL classifier.
+
+        Config files (e.g. ``config.yaml``) are typed ``other`` and never
+        reach the Python AST URL classifier, so a tunnel/proxy endpoint hidden
+        in a config value would otherwise go unnoticed. URLs are extracted from
+        the raw text so endpoints in comments are covered too.
+        """
+        findings: list[Finding] = []
+        for skill_file in skill.files:
+            if not self._is_config_file(skill_file.relative_path):
+                continue
+            content = skill_file.read_content()
+            if not content:
+                continue
+            for url in extract_urls(content):
+                if classify_url(url) != "suspicious":
+                    continue
+                display_url = self._redact_url_for_finding(url)
+                findings.append(
+                    Finding(
+                        id=self._generate_finding_id(
+                            "CONFIG_SUSPICIOUS_URL", f"{skill_file.relative_path}:{display_url}"
+                        ),
+                        rule_id="CONFIG_SUSPICIOUS_URL",
+                        category=ThreatCategory.DATA_EXFILTRATION,
+                        severity=Severity.HIGH,
+                        title="Suspicious URL in configuration file",
+                        description=(
+                            f"Configuration file references '{display_url}', which is on a known "
+                            f"suspicious/tunnel domain that may route data to an attacker-controlled endpoint."
+                        ),
+                        file_path=skill_file.relative_path,
+                        line_number=self._find_line_number(content, url),
+                        snippet=display_url,
+                        remediation=(
+                            "Verify the endpoint is legitimate and documented; "
+                            "remove tunnel/proxy or exfiltration URLs from configuration."
+                        ),
+                        analyzer="static",
+                        metadata={"url": display_url},
+                    )
+                )
+        return findings
+
+    @staticmethod
+    def _find_line_number(content: str, needle: str) -> int | None:
+        """Best-effort 1-based line number of the first line containing ``needle``."""
+        for index, line in enumerate(content.splitlines(), start=1):
+            if needle in line:
+                return index
+        return None
+
+    @staticmethod
+    def _redact_url_for_finding(url: str) -> str:
+        """Remove credentials, query values, and fragments from report URLs."""
+        try:
+            parts = urlsplit(url)
+            hostname = parts.hostname or ""
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            port = parts.port
+        except ValueError:
+            return "<redacted-url>"
+
+        if port is not None:
+            hostname = f"{hostname}:{port}"
+        netloc = f"<redacted>@{hostname}" if parts.username is not None else hostname
+        query = "<redacted>" if parts.query else ""
+        fragment = "<redacted>" if parts.fragment else ""
+        return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
 
     def _scan_referenced_files(self, skill: Skill) -> list[Finding]:
         """Scan files referenced in instruction body with recursive scanning."""
@@ -1007,6 +1346,108 @@ class StaticAnalyzer(BaseAnalyzer):
                             analyzer="static",
                         )
                     )
+
+        return findings
+
+    # ------------------------------------------------------------------ #
+    # ASCII Smuggling / Unicode Tag Block detection                        #
+    # ------------------------------------------------------------------ #
+
+    # Unicode Tag Block: U+E0000 (TAG NULL) through U+E007F (TAG DELETE).
+    # U+E0020–U+E007E map 1-to-1 to printable ASCII.  No legitimate use
+    # for these codepoints exists in skill files.
+    _TAG_BLOCK_START = 0xE0000
+    _TAG_BLOCK_END = 0xE007F
+    _TAG_PRINTABLE_START = 0xE0020
+    _TAG_PRINTABLE_END = 0xE007E
+    _TAG_BOUNDARY_CODEPOINTS = frozenset([0xE0000, 0xE0001, 0xE007F])
+
+    @staticmethod
+    def _decode_tag_chars(tag_codepoints: list[int]) -> str:
+        """Decode Tag Block codepoints back to their ASCII equivalents."""
+        decoded: list[str] = []
+        for cp in tag_codepoints:
+            ascii_cp = cp - 0xE0000
+            if 0x20 <= ascii_cp <= 0x7E:
+                decoded.append(chr(ascii_cp))
+            elif ascii_cp == 0x01:
+                decoded.append("<SOT>")
+            elif ascii_cp == 0x7F:
+                decoded.append("<EOT>")
+            else:
+                decoded.append("?")
+        return "".join(decoded)
+
+    def _check_ascii_smuggling(self, skill: Skill) -> list[Finding]:
+        """Detect ASCII smuggling via Unicode Tag Block characters (U+E0000–U+E007F).
+
+        ASCII smuggling encodes each printable ASCII character as its invisible
+        Tag Block counterpart and embeds the result inside skill files.  The
+        payload is invisible in editors and terminals but is decoded by LLMs,
+        enabling hidden prompt-injection instructions.
+
+        Reference: https://embracethered.com/blog/posts/2026/scary-agent-skills/
+        """
+        findings: list[Finding] = []
+
+        for skill_file in skill.files:
+            if skill_file.content is None:
+                continue
+
+            content: str = skill_file.content
+            tag_chars: list[int] = []
+            first_line: int = 1
+            first_line_located = False
+
+            for line_no, line in enumerate(content.split("\n"), start=1):
+                for ch in line:
+                    cp = ord(ch)
+                    if self._TAG_BLOCK_START <= cp <= self._TAG_BLOCK_END:
+                        tag_chars.append(cp)
+                        if not first_line_located:
+                            first_line = line_no
+                            first_line_located = True
+
+            if not tag_chars:
+                continue
+
+            decoded = self._decode_tag_chars(tag_chars)
+            preview = decoded[:120] + ("…" if len(decoded) > 120 else "")
+            printable_count = sum(1 for cp in tag_chars if self._TAG_PRINTABLE_START <= cp <= self._TAG_PRINTABLE_END)
+            boundary_count = sum(1 for cp in tag_chars if cp in self._TAG_BOUNDARY_CODEPOINTS)
+
+            findings.append(
+                Finding(
+                    id=self._generate_finding_id("ASCII_SMUGGLING_TAG_BLOCK", skill_file.relative_path),
+                    rule_id="ASCII_SMUGGLING_TAG_BLOCK",
+                    category=ThreatCategory.PROMPT_INJECTION,
+                    severity=Severity.CRITICAL,
+                    title="ASCII smuggling via Unicode Tag Block detected",
+                    description=(
+                        f"ASCII smuggling detected in '{skill_file.relative_path}': "
+                        f"{len(tag_chars)} Unicode Tag Block character(s) found "
+                        f"({printable_count} printable, {boundary_count} boundary marker(s)). "
+                        f"First occurrence at line {first_line}. "
+                        f"Decoded hidden payload (first 120 chars): «{preview}». "
+                        "Tag Block characters (U+E0000–U+E007F) are invisible in editors "
+                        "but are decoded by LLMs, enabling hidden prompt-injection payloads "
+                        "inside otherwise-legitimate skill files."
+                    ),
+                    file_path=skill_file.relative_path,
+                    line_number=first_line,
+                    remediation=(
+                        "Remove all Unicode Tag Block characters (U+E0000–U+E007F) "
+                        "from the file. "
+                        "You can strip them with: "
+                        'python3 -c "'
+                        "import sys; t=open(sys.argv[1]).read(); "
+                        "open(sys.argv[1],'w').write("
+                        "''.join(c for c in t if not(0xE0000<=ord(c)<=0xE007F)))\" <file>. "
+                        "Or use the 'aid' tool: https://github.com/wunderwuzzi23/aid"
+                    ),
+                    analyzer="static",
+                )
+            )
 
         return findings
 
@@ -2293,29 +2734,36 @@ class StaticAnalyzer(BaseAnalyzer):
                 matched_data = string_match.get("matched_data", "")
                 has_ascii_letters = any("A" <= char <= "Z" or "a" <= char <= "z" for char in line_content)
 
-                # Filter short matches in non-Latin context (likely legitimate i18n)
-                short_match_max = self.policy.analysis_thresholds.short_match_max_chars
-                if len(matched_data) <= short_match_max and not has_ascii_letters:
-                    continue
+                # $tag_block matches Unicode Tag Block bytes (U+E0000-U+E007F) used
+                # for ASCII smuggling.  These codepoints have no legitimate use in
+                # skill files, so we must never suppress them regardless of line
+                # length, i18n markers, or script context.  Skip all FP filters for
+                # this specific pattern.
+                if string_identifier != "$tag_block":
+                    # Filter short matches in non-Latin context (likely legitimate i18n)
+                    short_match_max = self.policy.analysis_thresholds.short_match_max_chars
+                    if len(matched_data) <= short_match_max and not has_ascii_letters:
+                        continue
 
-                # Filter if context suggests legitimate internationalization
-                i18n_markers = ("i18n", "locale", "translation", "lang=", "charset", "utf-8", "encoding")
-                if any(marker in line_content.lower() for marker in i18n_markers):
-                    continue
+                    # Filter if context suggests legitimate internationalization
+                    i18n_markers = ("i18n", "locale", "translation", "lang=", "charset", "utf-8", "encoding")
+                    if any(marker in line_content.lower() for marker in i18n_markers):
+                        continue
 
-                # Filter Cyrillic, CJK, Arabic, Hebrew text (legitimate non-Latin content)
-                # These are indicated by presence of those scripts without zero-width chars
-                cyrillic_cjk_pattern = any(
-                    ("\u0400" <= char <= "\u04ff")  # Cyrillic
-                    or ("\u4e00" <= char <= "\u9fff")  # CJK Unified
-                    or ("\u0600" <= char <= "\u06ff")  # Arabic
-                    or ("\u0590" <= char <= "\u05ff")  # Hebrew
-                    for char in line_content
-                )
-                # If the line has legitimate non-Latin text but matched only a few zero-width chars, skip
-                cyrillic_cjk_min = self.policy.analysis_thresholds.cyrillic_cjk_min_chars
-                if cyrillic_cjk_pattern and len(matched_data) < cyrillic_cjk_min:
-                    continue
+                    # Filter Cyrillic, CJK, Arabic, Hebrew text (legitimate non-Latin content)
+                    # These are indicated by presence of those scripts without zero-width chars
+                    cyrillic_cjk_pattern = any(
+                        ("\u0400" <= char <= "\u04ff")  # Cyrillic
+                        or ("\u4e00" <= char <= "\u9fff")  # CJK Unified
+                        or ("\u0600" <= char <= "\u06ff")  # Arabic
+                        or ("\u0590" <= char <= "\u05ff")  # Hebrew
+                        for char in line_content
+                    )
+                    # If the line has legitimate non-Latin text but matched only a
+                    # few zero-width chars, skip.
+                    cyrillic_cjk_min = self.policy.analysis_thresholds.cyrillic_cjk_min_chars
+                    if cyrillic_cjk_pattern and len(matched_data) < cyrillic_cjk_min:
+                        continue
 
             finding_id = self._generate_finding_id(f"YARA_{rule_name}", f"{file_path}:{string_match['line_number']}")
 
@@ -2353,6 +2801,7 @@ class StaticAnalyzer(BaseAnalyzer):
 
         category_map = {
             "PROMPT INJECTION": ThreatCategory.PROMPT_INJECTION,
+            "JAILBREAK": ThreatCategory.PROMPT_INJECTION,  # AITech-2.1: Jailbreak maps to prompt injection
             "INJECTION ATTACK": ThreatCategory.COMMAND_INJECTION,
             "COMMAND INJECTION": ThreatCategory.COMMAND_INJECTION,
             "CREDENTIAL HARVESTING": ThreatCategory.HARDCODED_SECRETS,
@@ -2372,7 +2821,7 @@ class StaticAnalyzer(BaseAnalyzer):
         if classification == "harmful":
             if "INJECTION" in threat_type or "CREDENTIAL" in threat_type:
                 severity = Severity.CRITICAL
-            elif "EXFILTRATION" in threat_type or "MANIPULATION" in threat_type:
+            elif "EXFILTRATION" in threat_type or "MANIPULATION" in threat_type or threat_type == "JAILBREAK":
                 severity = Severity.HIGH
             else:
                 severity = Severity.MEDIUM

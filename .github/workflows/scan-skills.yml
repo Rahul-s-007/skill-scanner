@@ -74,7 +74,7 @@ on:
         type: string
         default: "scan-all"
       extra_args:
-        description: "Additional CLI arguments passed verbatim"
+        description: "Additional validated CLI arguments from the workflow allowlist"
         required: false
         type: string
         default: ""
@@ -165,36 +165,102 @@ jobs:
         run: |
           set +e
 
-          ARGS="$INPUT_SCAN_MODE $INPUT_SKILL_PATH"
-          ARGS="$ARGS --format $INPUT_FORMAT --policy $INPUT_POLICY"
+          python - <<'PY'
+          import os
+          import shlex
+          import subprocess
+          import sys
 
-          if [ "$INPUT_SCAN_MODE" = "scan-all" ]; then
-            ARGS="$ARGS --recursive --check-overlap"
-          fi
+          value_flags = {
+              "--llm-provider": {"anthropic", "openai", "openai-compatible"},
+              "--llm-consensus-runs": "int",
+              "--llm-max-tokens": "int",
+              "--skill-file": "path",
+              "--custom-rules": "path",
+              "--taxonomy": "path",
+              "--threat-mapping": "path",
+          }
+          bool_flags = {
+              "--use-virustotal",
+              "--vt-upload-files",
+              "--use-aidefense",
+              "--use-trigger",
+              "--enable-meta",
+              "--detailed",
+              "--render-markdown",
+              "--no-render-markdown",
+              "--compact",
+              "--verbose",
+              "--fail-on-findings",
+          }
 
-          if [ "$INPUT_USE_LLM" = "true" ]; then
-            ARGS="$ARGS --use-llm"
-          fi
+          def validate_path(value: str) -> bool:
+              return bool(value) and "\n" not in value and "\r" not in value and "\x00" not in value
 
-          if [ "$INPUT_USE_BEHAVIORAL" = "true" ]; then
-            ARGS="$ARGS --use-behavioral"
-          fi
+          def validate_extra_args(raw: str) -> list[str]:
+              tokens = shlex.split(raw or "")
+              args: list[str] = []
+              i = 0
+              while i < len(tokens):
+                  token = tokens[i]
+                  if token in bool_flags:
+                      args.append(token)
+                      i += 1
+                      continue
+                  if token == "--rule-packs":
+                      args.append(token)
+                      i += 1
+                      if i >= len(tokens) or tokens[i].startswith("-"):
+                          raise SystemExit("::error::--rule-packs requires at least one pack name")
+                      while i < len(tokens) and not tokens[i].startswith("-"):
+                          if not tokens[i].replace("-", "").replace("_", "").isalnum():
+                              raise SystemExit(f"::error::Invalid rule pack name: {tokens[i]}")
+                          args.append(tokens[i])
+                          i += 1
+                      continue
+                  if token in value_flags:
+                      if i + 1 >= len(tokens):
+                          raise SystemExit(f"::error::{token} requires a value")
+                      value = tokens[i + 1]
+                      validator = value_flags[token]
+                      if validator == "int":
+                          if not value.isdigit() or int(value) < 1:
+                              raise SystemExit(f"::error::{token} requires a positive integer")
+                      elif isinstance(validator, set):
+                          if value not in validator:
+                              allowed = ", ".join(sorted(validator))
+                              raise SystemExit(f"::error::{token} must be one of: {allowed}")
+                      elif not validate_path(value):
+                          raise SystemExit(f"::error::{token} contains an invalid path value")
+                      args.extend([token, value])
+                      i += 2
+                      continue
+                  raise SystemExit(f"::error::Unsupported extra_args token: {token}")
+              return args
 
-          if [ "$INPUT_LENIENT" = "true" ]; then
-            ARGS="$ARGS --lenient"
-          fi
+          cmd = ["skill-scanner", os.environ["INPUT_SCAN_MODE"], os.environ["INPUT_SKILL_PATH"]]
+          cmd += ["--format", os.environ["INPUT_FORMAT"], "--policy", os.environ["INPUT_POLICY"]]
 
-          if [ "$INPUT_FORMAT" = "sarif" ]; then
-            ARGS="$ARGS --output results.sarif"
-          fi
+          if os.environ["INPUT_SCAN_MODE"] == "scan-all":
+              cmd += ["--recursive", "--check-overlap"]
+          if os.environ["INPUT_USE_LLM"] == "true":
+              cmd.append("--use-llm")
+          if os.environ["INPUT_USE_BEHAVIORAL"] == "true":
+              cmd.append("--use-behavioral")
+          if os.environ["INPUT_LENIENT"] == "true":
+              cmd.append("--lenient")
+          if os.environ["INPUT_FORMAT"] == "sarif":
+              cmd += ["--output", "results.sarif"]
 
-          ARGS="$ARGS --fail-on-severity $INPUT_FAIL_ON_SEVERITY $INPUT_EXTRA_ARGS"
+          cmd += ["--fail-on-severity", os.environ["INPUT_FAIL_ON_SEVERITY"]]
+          cmd += validate_extra_args(os.environ.get("INPUT_EXTRA_ARGS", ""))
 
-          echo "Running: skill-scanner $ARGS"
-          skill-scanner $ARGS
-          SCAN_EXIT=$?
-
-          echo "scan_exit_code=$SCAN_EXIT" >> "$GITHUB_ENV"
+          print("Running:", shlex.join(cmd))
+          result = subprocess.run(cmd, check=False)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"scan_exit_code={result.returncode}\n")
+          sys.exit(0)
+          PY
           exit 0
 
       - name: Upload SARIF to Code Scanning

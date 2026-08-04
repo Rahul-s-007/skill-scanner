@@ -27,10 +27,13 @@ from pathlib import Path
 
 import httpx
 
+from ...telemetry import external_span, record_external_error, record_external_retry
 from ..models import Finding, Severity, Skill, ThreatCategory
 from .base import BaseAnalyzer
 
 logger = logging.getLogger(__name__)
+
+_VT_SERVICE = "virustotal"
 
 
 class VirusTotalAnalyzer(BaseAnalyzer):
@@ -293,7 +296,9 @@ class VirusTotalAnalyzer(BaseAnalyzer):
             - If error: (None, False)
         """
         try:
-            response = self.session.get(f"{self.base_url}/files/{file_hash}", timeout=10)
+            with external_span(_VT_SERVICE, "file_report", {"vt.file_hash": file_hash}) as span:
+                response = self.session.get(f"{self.base_url}/files/{file_hash}", timeout=10)
+                span.set_attribute("http.status_code", response.status_code)
 
             if response.status_code == 404:
                 # File hash not in VirusTotal database (never scanned before)
@@ -322,12 +327,15 @@ class VirusTotalAnalyzer(BaseAnalyzer):
 
             if response.status_code == 429:
                 logger.warning("VirusTotal rate limit exceeded. Please wait before retrying.")
+                record_external_error(_VT_SERVICE, "rate_limit", operation="file_report")
             else:
                 logger.warning("VirusTotal API returned status %d", response.status_code)
+                record_external_error(_VT_SERVICE, f"http_{response.status_code}", operation="file_report")
             return None, False
 
         except httpx.RequestError as e:
             logger.warning("VirusTotal API request failed: %s", e)
+            record_external_error(_VT_SERVICE, type(e).__name__, operation="file_report")
             return None, False
 
     def _upload_and_scan(self, file_path: Path, file_hash: str) -> dict | None:
@@ -349,12 +357,21 @@ class VirusTotalAnalyzer(BaseAnalyzer):
                 logger.warning("File too large to upload to VT: %s (%d bytes)", file_path.name, file_size)
                 return None
 
-            with open(file_path, "rb") as f:
+            with (
+                external_span(
+                    _VT_SERVICE,
+                    "file_upload",
+                    {"vt.file_hash": file_hash, "vt.file_size_bytes": file_size},
+                ) as upload_span,
+                open(file_path, "rb") as f,
+            ):
                 files = {"file": (file_path.name, f)}
                 response = self.session.post(f"{self.base_url}/files", files=files, timeout=60)
+                upload_span.set_attribute("http.status_code", response.status_code)
 
             if response.status_code != 200:
                 logger.warning("File upload failed with status %d", response.status_code)
+                record_external_error(_VT_SERVICE, f"http_{response.status_code}", operation="file_upload")
                 return None
 
             upload_data = response.json()
@@ -370,7 +387,15 @@ class VirusTotalAnalyzer(BaseAnalyzer):
             for attempt in range(max_retries):
                 time.sleep(10)
 
-                analysis_response = self.session.get(f"{self.base_url}/analyses/{analysis_id}", timeout=10)
+                # Each poll is a retry against VT; surfaces analysis-wait pressure.
+                record_external_retry(_VT_SERVICE, "analysis_pending", operation="analysis_poll")
+                with external_span(
+                    _VT_SERVICE,
+                    "analysis_poll",
+                    {"vt.analysis_id": analysis_id, "vt.attempt": attempt + 1},
+                ) as poll_span:
+                    analysis_response = self.session.get(f"{self.base_url}/analyses/{analysis_id}", timeout=10)
+                    poll_span.set_attribute("http.status_code", analysis_response.status_code)
 
                 if analysis_response.status_code == 200:
                     analysis_data = analysis_response.json()
@@ -404,9 +429,11 @@ class VirusTotalAnalyzer(BaseAnalyzer):
 
         except httpx.RequestError as e:
             logger.warning("File upload to VirusTotal failed: %s", e)
+            record_external_error(_VT_SERVICE, type(e).__name__, operation="file_upload")
             return None
         except Exception as e:
             logger.warning("Unexpected error during file upload: %s", e)
+            record_external_error(_VT_SERVICE, type(e).__name__, operation="file_upload")
             return None
 
     def _create_finding(self, skill_file, file_hash: str, vt_result: dict) -> Finding:

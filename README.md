@@ -150,6 +150,10 @@ skill-scanner scan-all /path/to/skills --recursive --use-behavioral
 # Scan multiple skills with cross-skill overlap detection
 skill-scanner scan-all /path/to/skills --recursive --check-overlap
 
+# Scan a GitHub repository (owner/repo shorthand or full URL)
+skill-scanner scan-repo owner/repo
+skill-scanner scan-repo https://github.com/owner/repo --use-llm
+
 # Lenient mode: tolerate malformed skills instead of failing
 skill-scanner scan /path/to/skill --lenient
 skill-scanner scan-all /path/to/skills --recursive --lenient
@@ -188,6 +192,14 @@ skill-scanner generate-policy -o my_org_policy.yaml
 # Interactive policy configurator (TUI)
 skill-scanner configure-policy
 ```
+
+Consensus mode keeps a finding only when it appears in more than half of the
+configured runs. When those votes disagree on severity, the highest observed
+severity wins, independent of response order. Failed runs and successful runs
+that omit the finding cast no vote but remain in the denominator. This makes
+severity selection stable for majority-agreed findings. It does not make an
+individual LLM sample deterministic, and descriptive fields from equal-severity
+votes, single-run output, and non-majority findings can still vary between scans.
 
 **LLM provider note:** `--llm-provider` currently accepts `anthropic` or `openai`.
 For Bedrock, Vertex, Azure, Gemini, and other LiteLLM backends, set provider-specific model strings and environment variables (see [LLM Analyzer docs](docs/architecture/analyzers/llm-analyzer.md)).
@@ -240,7 +252,7 @@ if not result.is_safe:
 | `--use-behavioral` | Enable behavioral analyzer (dataflow analysis) |
 | `--use-llm` | Enable LLM analyzer (requires API key) |
 | `--llm-provider` | LLM provider for CLI routing: `anthropic` or `openai` |
-| `--llm-consensus-runs N` | Run LLM analysis `N` times and keep majority-agreed findings |
+| `--llm-consensus-runs N` | Run LLM analysis `N` times, keep majority-agreed findings, and retain their highest observed severity |
 | `--llm-max-tokens N` | Maximum output tokens for LLM responses (default: 8192) |
 | `--use-virustotal` | Enable VirusTotal binary scanner |
 | `--vt-api-key KEY` | Provide VirusTotal API key directly (optional) |
@@ -334,10 +346,26 @@ repos:
 Or install the built-in hook directly:
 
 ```bash
-skill-scanner-pre-commit install
+skill-scanner-pre-commit --install
 ```
 
-The hook automatically detects which skill directories have staged changes and only scans those, keeping commit times fast. Use `--all` to scan everything.
+The hook maps changed files to their nearest `SKILL.md` and scans each affected
+skill once. During a normal commit, it reads the staged diff. In CI, compare two
+revisions so no staged index is required:
+
+```bash
+pre-commit run skill-scanner --from-ref "$BASE_SHA" --to-ref "$HEAD_SHA"
+```
+
+Both revisions must exist in the checkout. To scan every configured skill,
+invoke the hook directly:
+
+```bash
+skill-scanner-pre-commit --scan-all
+```
+
+Alternatively, configure `args: [--scan-all]` for the hook in
+`.pre-commit-config.yaml`.
 
 ---
 

@@ -35,6 +35,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 _ENABLED: bool = False
 _TRACER: Any = None  # opentelemetry.trace.Tracer | None
-_METER: Any = None   # opentelemetry.metrics.Meter | None
+_METER: Any = None  # opentelemetry.metrics.Meter | None
 
 # Metric instruments (created lazily once the SDK is initialised)
 _SCAN_DURATION_HISTOGRAM: Any = None
@@ -59,6 +60,11 @@ _FINDINGS_COUNTER: Any = None
 _ANALYZER_DURATION_HISTOGRAM: Any = None
 _SCANS_TOTAL_COUNTER: Any = None
 _SCAN_ERRORS_COUNTER: Any = None
+
+# External-call instruments (VirusTotal, AI Defense, LLM providers)
+_EXTERNAL_DURATION_HISTOGRAM: Any = None
+_EXTERNAL_RETRIES_COUNTER: Any = None
+_EXTERNAL_ERRORS_COUNTER: Any = None
 
 _INSTRUMENTATION_SCOPE = "skill_scanner"
 
@@ -189,6 +195,9 @@ def setup_telemetry(config: TelemetryConfig | None = None) -> bool:
                 tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
             trace.set_tracer_provider(tracer_provider)
             _TRACER = trace.get_tracer(_INSTRUMENTATION_SCOPE, _INSTRUMENTATION_VERSION)
+            # Review item I: automatic client spans for every outbound httpx
+            # call (VirusTotal, AI Defense) with no analyzer code changes.
+            _instrument_httpx()
 
         # ---- Metrics ---------------------------------------------------------
         if config.export_metrics:
@@ -227,6 +236,8 @@ def shutdown_telemetry() -> None:
     global _ENABLED, _TRACER, _METER  # noqa: PLW0603
     global _SCAN_DURATION_HISTOGRAM, _FINDINGS_COUNTER  # noqa: PLW0603
     global _ANALYZER_DURATION_HISTOGRAM, _SCANS_TOTAL_COUNTER, _SCAN_ERRORS_COUNTER  # noqa: PLW0603
+    global _EXTERNAL_DURATION_HISTOGRAM, _EXTERNAL_RETRIES_COUNTER  # noqa: PLW0603
+    global _EXTERNAL_ERRORS_COUNTER  # noqa: PLW0603
 
     if not _ENABLED:
         return
@@ -248,6 +259,10 @@ def shutdown_telemetry() -> None:
         if hasattr(mp, "shutdown"):
             mp.shutdown()
 
+    # Remove httpx auto-instrumentation so a later setup_telemetry() can
+    # re-instrument against the new tracer provider.
+    _uninstrument_httpx()
+
     # Reset all globals so a subsequent setup_telemetry() can re-initialise cleanly.
     _ENABLED = False
     _TRACER = None
@@ -257,6 +272,9 @@ def shutdown_telemetry() -> None:
     _ANALYZER_DURATION_HISTOGRAM = None
     _SCANS_TOTAL_COUNTER = None
     _SCAN_ERRORS_COUNTER = None
+    _EXTERNAL_DURATION_HISTOGRAM = None
+    _EXTERNAL_RETRIES_COUNTER = None
+    _EXTERNAL_ERRORS_COUNTER = None
     logger.debug("OpenTelemetry shutdown complete")
 
 
@@ -435,9 +453,144 @@ def record_scan_error(
     )
 
 
+@contextmanager
+def external_span(
+    service: str,
+    operation: str = "",
+    attributes: dict[str, Any] | None = None,
+) -> Generator[Any, None, None]:
+    """Wrap an outbound call to an external service in a span + duration metric.
+
+    Use this around the actual HTTP / LLM call inside an analyzer so that
+    provider latency, retries and failures are visible in the trace rather than
+    hidden inside a single opaque ``skill_scanner.analyzer.*`` span::
+
+        with external_span("virustotal", "file_report") as span:
+            resp = httpx.get(...)
+            span.set_attribute("http.status_code", resp.status_code)
+
+    On exception the span is marked errored and the exception is recorded
+    before it propagates.  The error *counter* is deliberately NOT incremented
+    here: call sites own that, because most external failures (HTTP 429, 401,
+    5xx) never raise, and only the call site knows the semantic error type
+    (``rate_limit`` / ``auth_failure`` / ``timeout``).  Recording in both
+    places would double-count every raised failure.  When telemetry is
+    disabled this is a zero-overhead no-op.
+
+    Args:
+        service: Short service label (``"virustotal"``, ``"aidefense"``, ``"llm"``).
+        operation: Optional operation name (e.g. ``"file_report"``, ``"completion"``).
+        attributes: Extra span attributes set at creation time.
+
+    Yields:
+        The active span (or a no-op stub when telemetry is disabled).
+    """
+    if not _ENABLED or _TRACER is None:
+        yield _NoOpSpan()
+        return
+
+    span_attrs: dict[str, Any] = {"external.service": service}
+    if operation:
+        span_attrs["external.operation"] = operation
+    if attributes:
+        span_attrs.update(attributes)
+
+    span_name = f"skill_scanner.external.{service}"
+    started = time.time()
+    with _TRACER.start_as_current_span(span_name, attributes=span_attrs) as span:
+        try:
+            yield span
+        except Exception as exc:
+            _record_exception(span, exc)
+            raise
+        finally:
+            if _EXTERNAL_DURATION_HISTOGRAM is not None:
+                _EXTERNAL_DURATION_HISTOGRAM.record(
+                    time.time() - started,
+                    attributes={"external.service": service, "external.operation": operation},
+                )
+
+
+def record_external_retry(service: str, reason: str = "", operation: str = "") -> None:
+    """Increment the external-retry counter for a service.
+
+    Args:
+        service: Short service label (``"virustotal"``, ``"aidefense"``, ``"llm"``).
+        reason: Short retry cause (``"rate_limit"``, ``"timeout"``, ``"5xx"``).
+        operation: Optional operation name for additional label context.
+    """
+    if not _ENABLED or _EXTERNAL_RETRIES_COUNTER is None:
+        return
+
+    _EXTERNAL_RETRIES_COUNTER.add(
+        1,
+        attributes={
+            "external.service": service,
+            "external.operation": operation,
+            "retry.reason": reason[:128],
+        },
+    )
+
+
+def record_external_error(service: str, error_type: str = "unknown", operation: str = "") -> None:
+    """Increment the external-error counter for a service.
+
+    Args:
+        service: Short service label (``"virustotal"``, ``"aidefense"``, ``"llm"``).
+        error_type: Error category (``"rate_limit"``, ``"timeout"``, ``"auth_failure"``).
+        operation: Optional operation name for additional label context.
+    """
+    if not _ENABLED or _EXTERNAL_ERRORS_COUNTER is None:
+        return
+
+    _EXTERNAL_ERRORS_COUNTER.add(
+        1,
+        attributes={
+            "external.service": service,
+            "external.operation": operation,
+            "error.type": error_type,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _instrument_httpx() -> None:
+    """Enable OpenTelemetry auto-instrumentation for outbound httpx calls.
+
+    No-ops when ``opentelemetry-instrumentation-httpx`` is not installed, so
+    the ``[otel]`` extra stays optional.
+    """
+    try:
+        from opentelemetry.instrumentation.httpx import (  # type: ignore[import-not-found]
+            HTTPXClientInstrumentor,
+        )
+    except ImportError:
+        logger.debug("opentelemetry-instrumentation-httpx not installed; skipping httpx spans")
+        return
+
+    with contextlib.suppress(Exception):
+        instrumentor = HTTPXClientInstrumentor()
+        if not instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.instrument()
+
+
+def _uninstrument_httpx() -> None:
+    """Reverse :func:`_instrument_httpx` so a later setup can re-instrument cleanly."""
+    try:
+        from opentelemetry.instrumentation.httpx import (  # type: ignore[import-not-found]
+            HTTPXClientInstrumentor,
+        )
+    except ImportError:
+        return
+
+    with contextlib.suppress(Exception):
+        instrumentor = HTTPXClientInstrumentor()
+        if instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.uninstrument()
 
 
 def _get_package_version() -> str:
@@ -466,8 +619,7 @@ def _build_span_exporter(config: TelemetryConfig) -> Any:
             return OTLPSpanExporter(endpoint=f"{config.otlp_endpoint}/v1/traces", headers=headers)
         except ImportError:
             logger.warning(
-                "OTLP trace exporter not available. "
-                "Install opentelemetry-exporter-otlp-proto-grpc or -http."
+                "OTLP trace exporter not available. Install opentelemetry-exporter-otlp-proto-grpc or -http."
             )
             return None
 
@@ -500,8 +652,7 @@ def _build_metric_exporter(config: TelemetryConfig) -> Any:
             )
         except ImportError:
             logger.warning(
-                "OTLP metric exporter not available. "
-                "Install opentelemetry-exporter-otlp-proto-grpc or -http."
+                "OTLP metric exporter not available. Install opentelemetry-exporter-otlp-proto-grpc or -http."
             )
             return None
 
@@ -595,6 +746,8 @@ def _create_metric_instruments() -> None:
     """Create all metric instruments on the global meter."""
     global _SCAN_DURATION_HISTOGRAM, _FINDINGS_COUNTER  # noqa: PLW0603
     global _ANALYZER_DURATION_HISTOGRAM, _SCANS_TOTAL_COUNTER, _SCAN_ERRORS_COUNTER  # noqa: PLW0603
+    global _EXTERNAL_DURATION_HISTOGRAM, _EXTERNAL_RETRIES_COUNTER  # noqa: PLW0603
+    global _EXTERNAL_ERRORS_COUNTER  # noqa: PLW0603
 
     if _METER is None:
         return
@@ -629,6 +782,25 @@ def _create_metric_instruments() -> None:
         name="skill_scanner.scan.errors",
         unit="{error}",
         description="Total number of skill scan errors or skipped skills.",
+    )
+
+    # External-call instruments: VirusTotal / AI Defense / LLM providers.
+    # These surface rate-limit pressure and provider latency trends.
+    _EXTERNAL_DURATION_HISTOGRAM = _METER.create_histogram(
+        name="skill_scanner.external.duration",
+        unit="s",
+        description="Wall-clock duration of outbound calls to external services.",
+        explicit_bucket_boundaries=[0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120],
+    )
+    _EXTERNAL_RETRIES_COUNTER = _METER.create_counter(
+        name="skill_scanner.external.retries",
+        unit="{retry}",
+        description="Total number of retries against external services, by service.",
+    )
+    _EXTERNAL_ERRORS_COUNTER = _METER.create_counter(
+        name="skill_scanner.external.errors",
+        unit="{error}",
+        description="Total external-service errors, by service and error type.",
     )
 
 

@@ -95,16 +95,23 @@ skill-scanner scan evals/skills/data-exfiltration/environment-secrets --format j
   ],
   "scan_duration_seconds": 0.13,
   "duration_ms": 127,
-  "analyzers_used": ["static_analyzer", "bytecode", "pipeline"],
+  "analyzers_used": ["static_analyzer", "bytecode", "pipeline", "llm_analyzer", "meta_analyzer"],
   "timestamp": "2026-02-19T21:58:33.032573",
   "scan_metadata": {
     "policy_name": "default",
     "policy_version": "1.0",
     "policy_preset_base": "balanced",
     "policy_fingerprint_sha256": "45b486..."
+  },
+  "llm_usage": {
+    "input_tokens": 5312,
+    "output_tokens": 842,
+    "total_tokens": 6154
   }
 }
 ```
+
+`llm_usage` is present when the configured provider reports non-zero token usage for an LLM call made by `--use-llm`, `--enable-meta`, and/or `--adjudicate`. It is aggregated across every LLM analyzer, meta-analysis, and adjudication call for the scan. The field is omitted when no usage is reported, including static-only scans and calls from providers that do not return usage metadata.
 
 Use `--compact` to remove pretty-printing for machine pipelines.
 

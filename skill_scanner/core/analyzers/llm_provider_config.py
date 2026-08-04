@@ -25,6 +25,8 @@ import importlib.util
 import logging
 import os
 
+from .llm_request_options import resolve_llm_user, supports_openai_user_param
+
 logger = logging.getLogger(__name__)
 
 # Check for Google GenAI availability
@@ -60,9 +62,11 @@ class ProviderConfig:
         api_key: str | None = None,
         base_url: str | None = None,
         api_version: str | None = None,
+        provider: str | None = None,
         aws_region: str | None = None,
         aws_profile: str | None = None,
         aws_session_token: str | None = None,
+        llm_user: str | None = None,
     ):
         """
         Initialize provider configuration.
@@ -70,34 +74,52 @@ class ProviderConfig:
         Args:
             model: Model identifier
             api_key: API key (if None, reads from environment)
-            base_url: Custom base URL (for Azure)
-            api_version: API version (for Azure)
+            base_url: Custom base URL (for Azure/OpenAI-compatible endpoints)
+            api_version: API version (for Azure/OpenAI-compatible endpoints)
+            provider: Explicit provider override
             aws_region: AWS region (for Bedrock)
             aws_profile: AWS profile name (for Bedrock)
             aws_session_token: AWS session token (for Bedrock)
+            llm_user: Optional raw Chat Completions user field for OpenAI-compatible routes
         """
         self.model = model
         self.base_url = base_url
         self.api_version = api_version
+        self.provider = self._normalize_provider(provider or os.getenv("SKILL_SCANNER_LLM_PROVIDER"))
+        self.llm_user = resolve_llm_user(llm_user)
         self.aws_region = aws_region or os.getenv("AWS_REGION", "us-east-1")
         self.aws_profile = aws_profile or os.getenv("AWS_PROFILE")
         self.aws_session_token = aws_session_token or os.getenv("AWS_SESSION_TOKEN")
 
-        # Detect provider type from model string
+        self.is_openai_compatible = self.provider in {"openai", "openai-compatible", "custom-openai"}
+
+        # Detect provider type from model string unless an explicit OpenAI-compatible
+        # override is set. Custom model names can include provider words such as
+        # "gemini" without meaning they should use the Google SDK.
         model_lower = model.lower()
-        self.is_bedrock = "bedrock/" in model or model_lower.startswith("bedrock/")
-        self.is_gemini = "gemini" in model_lower or model_lower.startswith("gemini/")
-        self.is_azure = model_lower.startswith("azure/") or "azure" in model_lower
-        self.is_vertex = model_lower.startswith("vertex_ai/") or "vertex" in model_lower
-        self.is_ollama = model_lower.startswith("ollama/")
-        self.is_openrouter = model_lower.startswith("openrouter/")
+        self.is_bedrock = not self.is_openai_compatible and ("bedrock/" in model or model_lower.startswith("bedrock/"))
+        self.is_gemini = not self.is_openai_compatible and (
+            "gemini" in model_lower or model_lower.startswith("gemini/")
+        )
+        self.is_azure = not self.is_openai_compatible and (model_lower.startswith("azure/") or "azure" in model_lower)
+        self.is_vertex = not self.is_openai_compatible and (
+            model_lower.startswith("vertex_ai/") or "vertex" in model_lower
+        )
+        self.is_ollama = not self.is_openai_compatible and model_lower.startswith("ollama/")
+        self.is_openrouter = not self.is_openai_compatible and model_lower.startswith("openrouter/")
         self.is_gpt5 = "gpt-5" in model_lower
 
         # Determine if we should use Google SDK
         self.use_google_sdk = False
 
         # Handle Vertex AI separately (uses LiteLLM, not Google SDK)
-        if self.is_vertex:
+        if self.is_openai_compatible:
+            if not LITELLM_AVAILABLE:
+                raise ImportError(
+                    "LiteLLM is required for OpenAI-compatible providers. Install with: pip install litellm"
+                )
+            self.model = self._normalize_openai_compatible_model_name(model)
+        elif self.is_vertex:
             # Vertex AI models stay as-is for LiteLLM
             if not LITELLM_AVAILABLE:
                 raise ImportError("LiteLLM is required for Vertex AI. Install with: pip install litellm")
@@ -106,7 +128,14 @@ class ProviderConfig:
             # Google AI Studio (uses Google SDK directly)
             self.use_google_sdk = True
             self.model = self._normalize_gemini_model_name(model)
-        elif self.is_gemini and not GOOGLE_GENAI_AVAILABLE:
+        elif self.is_gemini and LITELLM_AVAILABLE:
+            # Google AI Studio through LiteLLM when google-genai is not installed.
+            if not model.startswith("gemini/"):
+                model_name = model.replace("gemini-", "").replace("gemini/", "")
+                self.model = f"gemini/{model_name}"
+            else:
+                self.model = model
+        elif self.is_gemini:
             raise ImportError(
                 "For Gemini models, either LiteLLM or google-genai is required. "
                 "Install with: pip install litellm or pip install google-genai"
@@ -114,12 +143,7 @@ class ProviderConfig:
         elif not LITELLM_AVAILABLE:
             raise ImportError("LiteLLM is required for enhanced LLM analyzer. Install with: pip install litellm")
         else:
-            # Normalize Gemini model name for LiteLLM (Google AI Studio via LiteLLM)
-            if self.is_gemini and not model.startswith("gemini/"):
-                model_name = model.replace("gemini-", "").replace("gemini/", "")
-                self.model = f"gemini/{model_name}"
-            else:
-                self.model = model
+            self.model = model
 
         # Resolve API key (may acquire Entra ID token for Azure)
         self._using_entra_id = False
@@ -127,13 +151,34 @@ class ProviderConfig:
 
         # Note: Google SDK client is created per-request, not configured globally
 
+    def _normalize_provider(self, provider: str | None) -> str | None:
+        """Normalize provider aliases used by env vars, CLI, and SDK callers."""
+        if provider is None:
+            return None
+
+        normalized = provider.strip().lower().replace("_", "-")
+        if normalized in {"custom-openai", "openai-compatible"}:
+            return normalized
+        return normalized
+
+    def _normalize_openai_compatible_model_name(self, model: str) -> str:
+        """Force LiteLLM's OpenAI adapter for arbitrary OpenAI-compatible model names."""
+        if model.lower().startswith("openai/"):
+            return model
+        return f"openai/{model}"
+
     def _resolve_api_key(self, api_key: str | None) -> str | None:
         """Resolve API key from parameter or environment variables.
 
         Uses SKILL_SCANNER_LLM_API_KEY consistently for all providers.
 
         Special cases:
-        - Vertex AI: Uses GOOGLE_APPLICATION_CREDENTIALS (service account)
+        - Vertex AI: Always returns ``None`` -- LiteLLM/google-auth read
+          GOOGLE_APPLICATION_CREDENTIALS directly from the environment when
+          set, or fall back to ambient Application Default Credentials
+          (like Bedrock's IAM role) -- e.g. a GCE/Cloud Run attached
+          service account or Workload Identity, with no key file on disk
+          at all.
         - Ollama: No API key needed (local)
         - Azure: Falls back to Entra ID (``az login``) when no API key is set
         """
@@ -142,7 +187,7 @@ class ProviderConfig:
 
         # Special cases with different auth mechanisms
         if self.is_vertex:
-            return os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            return None
         elif self.is_ollama:
             return None
 
@@ -229,7 +274,7 @@ class ProviderConfig:
 
     def validate(self) -> None:
         """Validate that configuration is complete."""
-        if not self.is_bedrock and not self.is_ollama and not self.api_key:
+        if not self.is_bedrock and not self.is_ollama and not self.is_vertex and not self.api_key:
             if self.is_azure:
                 raise ValueError(
                     f"No API key or Entra ID credentials found for Azure model {self.model}. "
@@ -258,6 +303,9 @@ class ProviderConfig:
             params["api_base"] = self.base_url
         if self.api_version:
             params["api_version"] = self.api_version
+
+        if self.llm_user and supports_openai_user_param(self.model, self.provider):
+            params["user"] = self.llm_user
 
         if self.is_bedrock:
             # AWS Bedrock supports:

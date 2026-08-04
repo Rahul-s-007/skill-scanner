@@ -58,6 +58,7 @@ def _render_cli_reference() -> str:
         HelpBlock("Top-level CLI", ["-m", "skill_scanner.cli.cli", "--help"]),
         HelpBlock("scan", ["-m", "skill_scanner.cli.cli", "scan", "--help"]),
         HelpBlock("scan-all", ["-m", "skill_scanner.cli.cli", "scan-all", "--help"]),
+        HelpBlock("scan-repo", ["-m", "skill_scanner.cli.cli", "scan-repo", "--help"]),
         HelpBlock("validate-rules", ["-m", "skill_scanner.cli.cli", "validate-rules", "--help"]),
         HelpBlock("generate-policy", ["-m", "skill_scanner.cli.cli", "generate-policy", "--help"]),
         HelpBlock("configure-policy", ["-m", "skill_scanner.cli.cli", "configure-policy", "--help"]),
@@ -76,13 +77,14 @@ def _render_cli_reference() -> str:
         "|---|---|---|",
         "| `skill-scanner scan` | Scan a single skill package | `skill-scanner scan ./my-skill` |",
         "| `skill-scanner scan-all` | Scan multiple skill packages | `skill-scanner scan-all ./skills/ -r` |",
+        "| `skill-scanner scan-repo` | Clone and scan a GitHub repo (owner/repo or full URL) | `skill-scanner scan-repo owner/repo` |",
         "| `skill-scanner list-analyzers` | Show available analyzers | `skill-scanner list-analyzers` |",
         "| `skill-scanner validate-rules` | Validate YAML rule signatures | `skill-scanner validate-rules` |",
         "| `skill-scanner generate-policy` | Generate a policy YAML file | `skill-scanner generate-policy --preset strict` |",
         "| `skill-scanner configure-policy` | Interactive TUI policy editor | `skill-scanner configure-policy` |",
         "| `skill-scanner interactive` | Interactive setup wizard | `skill-scanner interactive` |",
         "| `skill-scanner-api` | Start the REST API server | `skill-scanner-api --port 8080` |",
-        "| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit install` |",
+        "| `skill-scanner-pre-commit` | Git pre-commit hook | `skill-scanner-pre-commit --install` |",
         "",
         "## Common Flags",
         "",
@@ -364,6 +366,7 @@ def _collect_env_variables() -> dict[str, set[str]]:
         ROOT / "skill_scanner" / "core" / "analyzers" / "llm_analyzer.py",
         ROOT / "skill_scanner" / "core" / "analyzer_factory.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "llm_provider_config.py",
+        ROOT / "skill_scanner" / "core" / "analyzers" / "llm_request_options.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "behavioral_analyzer.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "aidefense_analyzer.py",
         ROOT / "skill_scanner" / "core" / "analyzers" / "meta_analyzer.py",
@@ -389,10 +392,16 @@ def _collect_env_variables() -> dict[str, set[str]]:
 
 def _describe_env_var(var: str) -> str:
     descriptions = {
-        "SKILL_SCANNER_LLM_API_KEY": "Primary API key for LLM analyzer and meta fallback.",
+        "SKILL_SCANNER_LLM_API_KEY": (
+            "Primary API key for LLM analyzer and meta fallback. Required for "
+            "API-key-based providers; not required for Bedrock (IAM), Ollama "
+            "(local), or Vertex AI (ambient Application Default Credentials)."
+        ),
         "SKILL_SCANNER_LLM_MODEL": "Primary model identifier for semantic analysis.",
+        "SKILL_SCANNER_LLM_PROVIDER": "Optional provider override, including OpenAI-compatible custom endpoint routing.",
         "SKILL_SCANNER_LLM_BASE_URL": "Optional custom endpoint base URL for provider routing.",
         "SKILL_SCANNER_LLM_API_VERSION": "Optional API version for providers that require one.",
+        "SKILL_SCANNER_LLM_USER": "Optional raw Chat Completions user field for OpenAI-compatible routes.",
         "SKILL_SCANNER_LLM_FORCE_JSON_OBJECT": "Skip json_schema and start in plain JSON mode for incompatible proxies.",
         "SKILL_SCANNER_META_LLM_API_KEY": "Meta-analyzer API key override.",
         "SKILL_SCANNER_META_LLM_MODEL": "Meta-analyzer model override.",
@@ -405,7 +414,12 @@ def _describe_env_var(var: str) -> str:
         "AWS_REGION": "AWS region for Bedrock-backed flows.",
         "AWS_PROFILE": "AWS credential profile for Bedrock IAM auth.",
         "AWS_SESSION_TOKEN": "Optional AWS session token.",
-        "GOOGLE_APPLICATION_CREDENTIALS": "Path to GCP service account credentials.",
+        "GOOGLE_APPLICATION_CREDENTIALS": (
+            "Path to GCP service account credentials. Optional -- if unset, "
+            "`vertex_ai/*` models fall back to ambient Application Default "
+            "Credentials (e.g. a GCE/Cloud Run attached service account or "
+            "Workload Identity), same as Bedrock's IAM role fallback."
+        ),
         "SKILL_SCANNER_ALLOWED_ROOTS": "Colon-delimited API path allowlist for server-side path access.",
         "SKILL_SCANNER_TAXONOMY_PATH": "Path to a custom Cisco AI taxonomy YAML file (overridden by `--taxonomy`).",
         "SKILL_SCANNER_THREAT_MAPPING_PATH": "Path to a custom threat mapping YAML file (overridden by `--threat-mapping`).",
@@ -425,8 +439,10 @@ _ENV_VAR_GROUPS: list[tuple[str, str, list[str]]] = [
         [
             "SKILL_SCANNER_LLM_API_KEY",
             "SKILL_SCANNER_LLM_MODEL",
+            "SKILL_SCANNER_LLM_PROVIDER",
             "SKILL_SCANNER_LLM_BASE_URL",
             "SKILL_SCANNER_LLM_API_VERSION",
+            "SKILL_SCANNER_LLM_USER",
             "SKILL_SCANNER_LLM_FORCE_JSON_OBJECT",
         ],
     ),
@@ -484,8 +500,10 @@ _ENV_VAR_GROUPS: list[tuple[str, str, list[str]]] = [
 _ENV_VAR_EXAMPLES: dict[str, str] = {
     "SKILL_SCANNER_LLM_API_KEY": "sk-ant-...",
     "SKILL_SCANNER_LLM_MODEL": "anthropic/claude-sonnet-4-20250514",
+    "SKILL_SCANNER_LLM_PROVIDER": "openai",
     "SKILL_SCANNER_LLM_BASE_URL": "https://api.openai.com/v1",
     "SKILL_SCANNER_LLM_API_VERSION": "2024-02-15-preview",
+    "SKILL_SCANNER_LLM_USER": '{"appkey":"your-appkey"}',
     "SKILL_SCANNER_LLM_FORCE_JSON_OBJECT": "true",
     "SKILL_SCANNER_META_LLM_API_KEY": "(falls back to LLM_API_KEY)",
     "SKILL_SCANNER_META_LLM_MODEL": "(falls back to LLM_MODEL)",
@@ -509,7 +527,7 @@ _ENV_VAR_EXAMPLES: dict[str, str] = {
     "SKILL_SCANNER_THREAT_MAPPING_PATH": "/path/to/threats.yaml",
 }
 
-_ENV_VAR_REQUIRED: set[str] = {"SKILL_SCANNER_LLM_API_KEY"}
+_ENV_VAR_REQUIRED: set[str] = set()
 
 
 def _render_configuration_reference() -> str:

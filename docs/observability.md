@@ -137,18 +137,62 @@ attributes:
 | `skill_scanner.scan_directory` | `skills.directory` | Root directory scanned |
 | | `skills.count` | Skills discovered |
 | | `scan.recursive` | Whether recursive search was used |
-| | `report.total_skills` | Total skills scanned |
-| | `report.total_findings` | Aggregate findings count |
+| | `scan.check_overlap` | Whether cross-skill analysis ran |
+| | `skills.scanned` | Skills successfully scanned |
+| | `skills.skipped` | Skills skipped due to load/scan errors |
+| `skill_scanner.load_skill` | `skill.directory` | Directory being loaded |
+| | `skill.lenient` | Whether lenient loading was used |
+| | `skill.name` | Parsed skill name |
+| | `skill.file_count` | Files discovered in the package |
+| `skill_scanner.extract_archives` | `skill.archive_input_count` | Files considered for extraction |
+| | `skill.extracted_file_count` | Files produced by extraction |
+| | `skill.extraction_findings_count` | Findings raised during extraction |
+
+Separating `load_skill` and `extract_archives` from the root span makes
+"load time" and "extraction I/O" distinguishable from "analyze time".
 
 Each **analyzer** gets its own child span:
 
 ```
 skill_scanner.scan_skill
-  └── skill_scanner.analyzer.static
-  └── skill_scanner.analyzer.pipeline
-  └── skill_scanner.analyzer.behavioral
+  ├── skill_scanner.load_skill          (sibling: runs before the root span)
+  ├── skill_scanner.extract_archives
+  ├── skill_scanner.analyzer.static
+  ├── skill_scanner.analyzer.pipeline
+  ├── skill_scanner.analyzer.behavioral
   └── skill_scanner.analyzer.llm_analyzer   (phase=llm)
+        └── skill_scanner.external.llm      (provider call)
 ```
+
+### External-service spans
+
+Outbound calls to third-party services are wrapped in
+`skill_scanner.external.<service>` spans, so provider latency and retries are
+visible instead of being hidden inside an opaque analyzer span:
+
+| Span name | Operations | Notes |
+|---|---|---|
+| `skill_scanner.external.virustotal` | `file_report`, `file_upload`, `analysis_poll` | Carries `http.status_code`, `vt.attempt` |
+| `skill_scanner.external.aidefense` | `inspect` | Carries `http.status_code`, `external.attempt` |
+| `skill_scanner.external.llm` | `completion`, `meta_analysis`, `alignment` | Carries `llm.model`, `external.attempt` |
+
+Installing the `[otel]` extra also enables
+`opentelemetry-instrumentation-httpx`, which adds automatic client spans for
+**all** outbound HTTP requests with no analyzer code changes.
+
+### Span events
+
+Soft failures — paths that catch an exception and continue — are recorded as
+span events rather than disappearing silently:
+
+| Event | Emitted when |
+|---|---|
+| `skill_load_failed` | A skill in a directory scan fails to load |
+| `skill_scan_failed` | A skill raises an unexpected error mid-scan |
+| `cross_skill_overlap_check_failed` | Description-overlap analysis fails |
+| `cross_skill_pattern_detection_failed` | `CrossSkillScanner` fails |
+| `meta_analysis_failed` | API meta-analysis fails for a single scan |
+| `batch_meta_analysis_failed` | Batch meta-analysis run fails |
 
 Exceptions are automatically recorded on the span with `ERROR` status.
 
@@ -162,8 +206,20 @@ Exceptions are automatically recorded on the span with `ERROR` status.
 | `skill_scanner.scan.duration` | Histogram | `s` | Wall-clock scan time |
 | `skill_scanner.findings.total` | Counter | `{finding}` | Findings, labelled by `finding.severity` |
 | `skill_scanner.analyzer.duration` | Histogram | `s` | Per-analyzer timing, labelled by `analyzer.name` |
+| `skill_scanner.scan.errors` | Counter | `{error}` | Failed or skipped skills, labelled by `error.type` |
+| `skill_scanner.external.duration` | Histogram | `s` | External-call latency, labelled by `external.service` |
+| `skill_scanner.external.retries` | Counter | `{retry}` | Retries against external services, labelled by `retry.reason` |
+| `skill_scanner.external.errors` | Counter | `{error}` | External failures, labelled by `error.type` |
 
-All instruments carry `skill.name`, `scan.is_safe`, and `analyzers` labels.
+Scan instruments carry `skill.name`, `scan.is_safe`, and `analyzers` labels.
+External instruments carry `external.service` and `external.operation`.
+
+`error.type` values include `rate_limit`, `timeout`, `auth_failure`, and
+`http_<status>`, which makes it possible to alert on VirusTotal rate-limit
+pressure or LLM provider degradation directly.
+
+The duration histograms use explicit bucket boundaries tuned for scan
+workloads rather than SDK defaults, so percentiles are meaningful.
 
 ---
 

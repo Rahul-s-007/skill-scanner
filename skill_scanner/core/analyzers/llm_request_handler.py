@@ -28,9 +28,65 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
+from ...telemetry import external_span, record_external_error, record_external_retry
 from .llm_provider_config import ProviderConfig
+
+_LLM_SERVICE = "llm"
+
+
+class LLMTokenUsage(TypedDict):
+    """Provider-normalized token counts for one or more LLM calls."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+def _empty_token_usage() -> LLMTokenUsage:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _extract_token_usage(response: Any) -> LLMTokenUsage:
+    """Read token counts from a LiteLLM (or compatible) response object.
+
+    LiteLLM exposes usage as ``response.usage.prompt_tokens`` /
+    ``response.usage.completion_tokens``.  Both fields are normalised to the
+    ``input_tokens`` / ``output_tokens`` names used in our output schema so
+    callers never need to know which provider returned which key.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return _empty_token_usage()
+    input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    total_tokens = int(getattr(usage, "total_tokens", 0) or input_tokens + output_tokens)
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
+
+
+def _add_token_usage(total: LLMTokenUsage, delta: LLMTokenUsage) -> None:
+    """Accumulate *delta* into *total* in-place."""
+    total["input_tokens"] += delta["input_tokens"]
+    total["output_tokens"] += delta["output_tokens"]
+    total["total_tokens"] += delta["total_tokens"]
+
+
+def _extract_google_sdk_token_usage(response: Any) -> LLMTokenUsage:
+    """Read token counts from a Google GenAI SDK ``GenerateContentResponse``.
+
+    The SDK exposes usage as ``response.usage_metadata.prompt_token_count`` /
+    ``candidates_token_count``, normalised here to the same ``input_tokens`` /
+    ``output_tokens`` names ``_extract_token_usage`` produces for LiteLLM.
+    """
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return _empty_token_usage()
+    input_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+    output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+    total_tokens = int(getattr(usage, "total_token_count", 0) or input_tokens + output_tokens)
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
+
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +110,53 @@ except (ImportError, ModuleNotFoundError):
     GOOGLE_GENAI_AVAILABLE = False
     genai = None
 
+# Sentinel: caller did not supply ``temperature``; resolve from env (or use default).
+_TEMPERATURE_UNSET = object()
+
+# Env values that explicitly disable the temperature parameter so newer models
+# that reject ``temperature`` (e.g. Claude 4.x via Bedrock, OpenAI o1) work
+# without code changes.
+_TEMPERATURE_OMIT_VALUES = frozenset({"none", "null", "unset", "omit", "skip"})
+
+
+def _resolve_temperature(
+    explicit: Any,
+    env_var: str,
+    default: float,
+) -> float | None:
+    """Resolve the request-time ``temperature`` from constructor + env.
+
+    Precedence:
+        1. An explicit non-sentinel argument always wins (including ``None``,
+           which means "drop the parameter from the request").
+        2. ``os.environ[env_var]`` — a numeric value is parsed as a float, and
+           a value in ``_TEMPERATURE_OMIT_VALUES`` returns ``None`` to drop the
+           parameter.
+        3. ``default`` (today: 0.0 for the per-file analyzer, 0.1 for meta).
+
+    Returns:
+        ``float`` to send as ``temperature``, or ``None`` to omit it entirely.
+    """
+    if explicit is not _TEMPERATURE_UNSET:
+        return explicit
+
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default
+    if raw.lower() in _TEMPERATURE_OMIT_VALUES:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r (expected a float or 'none'); using %s",
+            env_var,
+            raw,
+            default,
+        )
+        return default
+
+
 # Suppress LiteLLM cosmetic warnings (doesn't affect functionality)
 warnings.filterwarnings("ignore", message=".*Pydantic serializer warnings.*")
 warnings.filterwarnings("ignore", message=".*Expected `Message`.*")
@@ -71,7 +174,7 @@ class LLMRequestHandler:
         self,
         provider_config: ProviderConfig,
         max_tokens: int = 8192,
-        temperature: float = 0.0,
+        temperature: Any = _TEMPERATURE_UNSET,
         max_retries: int = 3,
         rate_limit_delay: float = 2.0,
         timeout: int = 120,
@@ -82,14 +185,20 @@ class LLMRequestHandler:
         Args:
             provider_config: Provider configuration
             max_tokens: Maximum tokens for response
-            temperature: Sampling temperature
+            temperature: Sampling temperature.  Pass ``None`` to omit the
+                ``temperature`` parameter from the LLM request entirely —
+                required for models that reject it (e.g. Claude 4.x via
+                Bedrock, OpenAI o1-series).  When omitted, the value is
+                resolved from ``SKILL_SCANNER_LLM_TEMPERATURE`` (numeric
+                value, or ``"none"`` to drop the parameter), falling back
+                to ``0.0``.
             max_retries: Max retry attempts on rate limits
             rate_limit_delay: Base delay for exponential backoff
             timeout: Request timeout in seconds
         """
         self.provider_config = provider_config
         self.max_tokens = max_tokens
-        self.temperature = temperature
+        self.temperature = _resolve_temperature(temperature, "SKILL_SCANNER_LLM_TEMPERATURE", default=0.0)
         self.max_retries = max_retries
         self.rate_limit_delay = rate_limit_delay
         self.timeout = timeout
@@ -97,6 +206,14 @@ class LLMRequestHandler:
         # Load JSON schema for structured outputs
         self.response_schema = self._load_response_schema()
         self._use_plain_json_output = self._env_flag_enabled("SKILL_SCANNER_LLM_FORCE_JSON_OBJECT")
+
+        # Token usage for the most recent make_request() call (reset each call).
+        self._last_usage: LLMTokenUsage = _empty_token_usage()
+
+    @property
+    def last_usage(self) -> LLMTokenUsage:
+        """Token counts from the most recent make_request() call."""
+        return dict(self._last_usage)  # type: ignore[return-value]
 
     def _env_flag_enabled(self, env_name: str) -> bool:
         """Treat common truthy env values as enabled."""
@@ -173,7 +290,7 @@ class LLMRequestHandler:
             return True
 
         model_lower = self.provider_config.model.lower()
-        unsupported_json_schema_providers = ["deepseek"]
+        unsupported_json_schema_providers = ["deepseek", "minimax"]
         return any(name in model_lower for name in unsupported_json_schema_providers)
 
     def _build_response_format(self) -> dict[str, Any] | None:
@@ -230,6 +347,7 @@ class LLMRequestHandler:
         Raises:
             Exception: If all retries exhausted
         """
+        self._last_usage = _empty_token_usage()
         if self.provider_config.use_google_sdk:
             # For Google SDK, combine system and user messages into a single prompt
             # Google SDK doesn't have separate system/user roles like OpenAI/Anthropic
@@ -257,17 +375,28 @@ class LLMRequestHandler:
                     "model": self.provider_config.model,
                     "messages": messages,
                     "max_tokens": self.max_tokens,
-                    "temperature": self.temperature,
                     "timeout": self.timeout,
                     **self.provider_config.get_request_params(),
                 }
+                if self.temperature is not None:
+                    request_params["temperature"] = self.temperature
 
                 response_format = self._build_response_format()
                 if response_format:
                     request_params["response_format"] = response_format
 
-                response = await acompletion(**request_params, drop_params=True)
+                with external_span(
+                    _LLM_SERVICE,
+                    "completion",
+                    {
+                        "llm.model": str(self.provider_config.model),
+                        "llm.context": context,
+                        "external.attempt": attempt + 1,
+                    },
+                ):
+                    response = await acompletion(**request_params, drop_params=True)
                 content: str = response.choices[0].message.content or ""
+                self._last_usage = _extract_token_usage(response)
                 return content
 
             except Exception as e:
@@ -280,8 +409,19 @@ class LLMRequestHandler:
                     self._use_plain_json_output = True
                     retry_params = dict(request_params)
                     retry_params["response_format"] = {"type": "json_object"}
-                    response = await acompletion(**retry_params, drop_params=True)
+                    record_external_retry(_LLM_SERVICE, "structured_output_rejected", operation="completion")
+                    with external_span(
+                        _LLM_SERVICE,
+                        "completion",
+                        {
+                            "llm.model": str(self.provider_config.model),
+                            "llm.context": context,
+                            "llm.fallback": "json_object",
+                        },
+                    ):
+                        response = await acompletion(**retry_params, drop_params=True)
                     content: str = response.choices[0].message.content or ""
+                    self._last_usage = _extract_token_usage(response)
                     return content
 
                 last_exception = e
@@ -292,6 +432,7 @@ class LLMRequestHandler:
                     keyword in error_msg
                     for keyword in ["rate limit", "quota", "too many requests", "429", "throttling"]
                 ):
+                    record_external_error(_LLM_SERVICE, "rate_limit", operation="completion")
                     if attempt < self.max_retries:
                         delay = (2**attempt) * self.rate_limit_delay
                         logger.warning(
@@ -301,11 +442,13 @@ class LLMRequestHandler:
                             attempt + 1,
                             self.max_retries + 1,
                         )
+                        record_external_retry(_LLM_SERVICE, "rate_limit", operation="completion")
                         await asyncio.sleep(delay)
                         continue
 
                 # For other errors, don't retry
                 logger.error("LLM API error for %s: %s", context, e)
+                record_external_error(_LLM_SERVICE, type(e).__name__, operation="completion")
                 break
 
         if last_exception is not None:
@@ -325,8 +468,9 @@ class LLMRequestHandler:
                 # New SDK uses GenerateContentConfig type
                 config_dict: dict[str, Any] = {
                     "max_output_tokens": self.max_tokens,
-                    "temperature": self.temperature,
                 }
+                if self.temperature is not None:
+                    config_dict["temperature"] = self.temperature
 
                 # Add structured output support using Google Gemini SDK format
                 # According to Gemini docs: https://ai.google.dev/gemini-api/docs/structured-output
@@ -352,6 +496,7 @@ class LLMRequestHandler:
                     return response
 
                 response = await loop.run_in_executor(None, generate)
+                self._last_usage = _extract_google_sdk_token_usage(response)
 
                 # Extract text from response (new SDK format)
                 # Response has .text attribute directly

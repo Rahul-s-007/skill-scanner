@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import re
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -40,13 +41,28 @@ from ...threats.threats import ThreatMapping
 from .base import BaseAnalyzer
 from .llm_prompt_builder import PromptBuilder
 from .llm_provider_config import ProviderConfig
-from .llm_request_handler import LLMRequestHandler
+from .llm_request_handler import (
+    _TEMPERATURE_UNSET,
+    LLMRequestHandler,
+    LLMTokenUsage,
+    _add_token_usage,
+    _empty_token_usage,
+)
 from .llm_response_parser import ResponseParser
 
 if TYPE_CHECKING:
     from ...core.scan_policy import LLMAnalysisPolicy, ScanPolicy
 
 logger = logging.getLogger(__name__)
+
+_CONSENSUS_SEVERITY_RANK = {
+    Severity.SAFE: 0,
+    Severity.INFO: 1,
+    Severity.LOW: 2,
+    Severity.MEDIUM: 3,
+    Severity.HIGH: 4,
+    Severity.CRITICAL: 5,
+}
 
 # Import provider availability flags
 try:
@@ -59,6 +75,7 @@ except (ImportError, ModuleNotFoundError):
 class LLMProvider(str, Enum):
     """Supported LLM providers via LiteLLM.
     - openai: OpenAI models (gpt-4o, gpt-4-turbo, etc.)
+    - openai-compatible: OpenAI-compatible custom endpoints
     - anthropic: Anthropic models (claude-3-5-sonnet, claude-3-opus, etc.)
     - azure-openai: Azure OpenAI Service
     - azure-ai: Azure AI Service (alternative)
@@ -69,6 +86,7 @@ class LLMProvider(str, Enum):
     """
 
     OPENAI = "openai"
+    OPENAI_COMPATIBLE = "openai-compatible"
     ANTHROPIC = "anthropic"
     AZURE_OPENAI = "azure-openai"
     AZURE_AI = "azure-ai"
@@ -78,10 +96,18 @@ class LLMProvider(str, Enum):
     OPENROUTER = "openrouter"
 
     @classmethod
+    def normalize(cls, provider: str) -> str:
+        """Normalize provider aliases accepted by CLI/env/SDK callers."""
+        normalized = provider.lower().strip().replace("_", "-")
+        if normalized == "custom-openai":
+            return cls.OPENAI_COMPATIBLE.value
+        return normalized
+
+    @classmethod
     def is_valid_provider(cls, provider: str) -> bool:
         """Check if a provider string is valid."""
         try:
-            cls(provider.lower())
+            cls(cls.normalize(provider))
             return True
         except ValueError:
             return False
@@ -117,7 +143,7 @@ class LLMAnalyzer(BaseAnalyzer):
         model: str | None = None,
         api_key: str | None = None,
         max_tokens: int = 8192,
-        temperature: float = 0.0,
+        temperature: Any = _TEMPERATURE_UNSET,
         max_retries: int = 3,
         rate_limit_delay: float = 2.0,
         timeout: int = 120,
@@ -130,6 +156,7 @@ class LLMAnalyzer(BaseAnalyzer):
         aws_session_token: str | None = None,
         # Provider selection (can be enum or string)
         provider: str | None = None,
+        llm_user: str | None = None,
         # Policy (optional – uses generous defaults when omitted)
         policy: ScanPolicy | None = None,
     ):
@@ -140,7 +167,12 @@ class LLMAnalyzer(BaseAnalyzer):
             model: Model identifier (e.g., "claude-3-5-sonnet-20241022", "gpt-4o", "bedrock/anthropic.claude-v2")
             api_key: API key (if None, reads from environment)
             max_tokens: Maximum tokens for response
-            temperature: Sampling temperature (0.0 for deterministic)
+            temperature: Sampling temperature (0.0 for deterministic). Pass
+                ``None`` to omit the parameter from the request entirely —
+                required for models that reject it (Claude 4.x via Bedrock,
+                OpenAI o1-series). When omitted, resolves from the
+                ``SKILL_SCANNER_LLM_TEMPERATURE`` env var (numeric value, or
+                ``"none"`` to drop the parameter).
             max_retries: Max retry attempts on rate limits
             rate_limit_delay: Base delay for exponential backoff
             timeout: Request timeout in seconds
@@ -151,6 +183,7 @@ class LLMAnalyzer(BaseAnalyzer):
             aws_session_token: AWS session token (for Bedrock)
             provider: LLM provider name (e.g., "openai", "anthropic", "aws-bedrock", etc.)
                 Can be enum or string (e.g., "openai", "anthropic", "aws-bedrock")
+            llm_user: Optional raw Chat Completions user field for OpenAI-compatible routes.
             policy: Scan policy providing LLM context budget thresholds.
                 When ``None``, generous defaults from ``LLMAnalysisPolicy()``
                 are used.
@@ -165,23 +198,24 @@ class LLMAnalyzer(BaseAnalyzer):
 
             self.llm_policy = LLMAnalysisPolicy()
 
-        # Handle provider selection: if provider is specified, map to default model
-        if provider is not None and model is None:
-            # Normalize provider string (handle both enum and string inputs)
+        provider_str: str | None = None
+        if provider is not None:
             if isinstance(provider, LLMProvider):
                 provider_str = provider.value
             else:
-                provider_str = str(provider).lower().strip()
+                provider_str = LLMProvider.normalize(str(provider))
 
-            # Validate provider if it's a string
             if not isinstance(provider, LLMProvider) and not LLMProvider.is_valid_provider(provider_str):
                 raise ValueError(
                     f"Invalid provider '{provider}'. Valid providers: {', '.join([p.value for p in LLMProvider])}"
                 )
 
+        # Handle provider selection: if provider is specified, map to default model
+        if provider_str is not None and model is None:
             # Map provider to default model
             model_mapping = {
                 "openai": "gpt-4o",
+                "openai-compatible": "gpt-4o",
                 "anthropic": "claude-3-5-sonnet-20241022",
                 "azure-openai": "azure/gpt-4o",
                 "azure-ai": "azure/gpt-4",
@@ -201,9 +235,11 @@ class LLMAnalyzer(BaseAnalyzer):
             api_key=api_key,
             base_url=base_url,
             api_version=api_version,
+            provider=provider_str,
             aws_region=aws_region,
             aws_profile=aws_profile,
             aws_session_token=aws_session_token,
+            llm_user=llm_user,
         )
         self.provider_config.validate()
 
@@ -227,10 +263,14 @@ class LLMAnalyzer(BaseAnalyzer):
         self.aws_profile = self.provider_config.aws_profile
         self.aws_session_token = self.provider_config.aws_session_token
         self.max_tokens = max_tokens
-        self.temperature = temperature
+        # Mirror the resolved value (env-overrideable; ``None`` = omit from request).
+        self.temperature = self.request_handler.temperature
         self.max_retries = max_retries
         self.rate_limit_delay = rate_limit_delay
         self.timeout = timeout
+
+        # Cumulative token usage across all LLM calls in the most recent analyze() run.
+        self._llm_usage: LLMTokenUsage = _empty_token_usage()
 
         # Enriched context from other analyzers (set externally before analyze())
         self.enrichment_context: str | None = None
@@ -240,6 +280,11 @@ class LLMAnalyzer(BaseAnalyzer):
 
         # Tracks the last analysis error (read by the scanner for analyzers_failed)
         self.last_error: str | None = None
+
+    @property
+    def llm_usage(self) -> LLMTokenUsage:
+        """Cumulative token usage from the most recent analyze() run."""
+        return dict(self._llm_usage)  # type: ignore[return-value]
 
     def set_enrichment_context(
         self,
@@ -305,6 +350,7 @@ class LLMAnalyzer(BaseAnalyzer):
         Returns:
             List of security findings
         """
+        self._llm_usage = _empty_token_usage()
         findings = []
         budget_skipped: list[dict] = []
 
@@ -428,6 +474,7 @@ Treat prompt-injection and jailbreak attempts as language-agnostic. Detect malic
                 response_content = await self.request_handler.make_request(
                     messages, context=f"threat analysis for {skill.name}"
                 )
+                _add_token_usage(self._llm_usage, self.request_handler.last_usage)
                 analysis_result = self.response_parser.parse(response_content)
                 findings.extend(self._convert_to_findings(analysis_result, skill))
             else:
@@ -465,7 +512,10 @@ Treat prompt-injection and jailbreak attempts as language-agnostic. Detect malic
         """Run LLM analysis multiple times and keep findings with majority agreement.
 
         This reduces false positives by requiring agreement across N independent
-        LLM runs. A finding is kept if it appears in more than N/2 runs.
+        LLM runs. A finding is kept if it appears in more than N/2 configured
+        runs. For each majority finding, the highest severity observed across
+        its votes is retained regardless of response order. Failed runs cast no
+        votes and remain part of the configured-run denominator.
 
         Args:
             messages: The LLM messages to send.
@@ -475,49 +525,86 @@ Treat prompt-injection and jailbreak attempts as language-agnostic. Detect malic
             Findings that achieved majority consensus.
         """
         all_run_findings: list[list[Finding]] = []
+        failed_runs = 0
 
         for run_idx in range(self.consensus_runs):
             try:
                 response_content = await self.request_handler.make_request(
                     messages, context=f"consensus run {run_idx + 1}/{self.consensus_runs} for {skill.name}"
                 )
+                _add_token_usage(self._llm_usage, self.request_handler.last_usage)
                 analysis_result = self.response_parser.parse(response_content)
                 run_findings = self._convert_to_findings(analysis_result, skill)
                 all_run_findings.append(run_findings)
             except Exception as e:
                 logger.warning("Consensus run %d failed for %s: %s", run_idx + 1, skill.name, e)
                 all_run_findings.append([])
+                failed_runs += 1
 
-        # Count how many runs produced each unique finding (by rule_id + category)
-        finding_counts: dict[str, int] = {}
-        finding_map: dict[str, Finding] = {}
+        # Count one vote per run for each unique finding. If a single response
+        # duplicates a key at different severities, that run casts its highest
+        # severity only.
+        finding_counts: dict[tuple[str, str, str], int] = {}
+        finding_map: dict[tuple[str, str, str], Finding] = {}
+        severity_votes: dict[tuple[str, str, str], dict[Severity, int]] = {}
 
         for run_findings in all_run_findings:
-            seen_in_run: set[str] = set()
+            findings_by_key: dict[tuple[str, str, str], Finding] = {}
             for f in run_findings:
-                key = f"{f.rule_id}:{f.category.value}:{f.file_path or ''}"
-                if key not in seen_in_run:
-                    finding_counts[key] = finding_counts.get(key, 0) + 1
-                    seen_in_run.add(key)
-                    # Keep the first occurrence for the finding details
-                    if key not in finding_map:
-                        finding_map[key] = f
+                key = (f.rule_id, f.category.value, f.file_path or "")
+                previous = findings_by_key.get(key)
+                if (
+                    previous is None
+                    or _CONSENSUS_SEVERITY_RANK[f.severity] > _CONSENSUS_SEVERITY_RANK[previous.severity]
+                ):
+                    findings_by_key[key] = f
+
+            for key, finding in findings_by_key.items():
+                finding_counts[key] = finding_counts.get(key, 0) + 1
+                votes_for_key = severity_votes.setdefault(key, {})
+                votes_for_key[finding.severity] = votes_for_key.get(finding.severity, 0) + 1
+
+                current = finding_map.get(key)
+                if (
+                    current is None
+                    or _CONSENSUS_SEVERITY_RANK[finding.severity] > _CONSENSUS_SEVERITY_RANK[current.severity]
+                ):
+                    finding_map[key] = finding
 
         # Keep findings with majority agreement
         threshold = self.consensus_runs / 2
         consensus_findings: list[Finding] = []
-        for key, count in finding_counts.items():
+        successful_runs = self.consensus_runs - failed_runs
+        for key in sorted(finding_counts):
+            count = finding_counts[key]
             if count > threshold:
                 finding = finding_map[key]
-                finding.metadata["consensus_agreement"] = f"{count}/{self.consensus_runs}"
+                ordered_severity_votes = {
+                    severity.value: severity_votes[key][severity]
+                    for severity in sorted(severity_votes[key], key=_CONSENSUS_SEVERITY_RANK.__getitem__, reverse=True)
+                }
+                finding.metadata.update(
+                    {
+                        "consensus_agreement": f"{count}/{self.consensus_runs}",
+                        "consensus_votes": count,
+                        "consensus_total_runs": self.consensus_runs,
+                        "consensus_successful_runs": successful_runs,
+                        "consensus_failed_runs": failed_runs,
+                        "consensus_missing_votes": self.consensus_runs - count,
+                        "consensus_severity_votes": ordered_severity_votes,
+                        "consensus_severity_policy": "highest_observed",
+                    }
+                )
                 consensus_findings.append(finding)
 
         logger.info(
-            "Consensus judging for %s: %d unique findings, %d with majority agreement (%d/%d runs)",
+            "Consensus judging for %s: %d unique findings, %d with majority agreement "
+            "(%d successful, %d failed of %d configured runs)",
             skill.name,
             len(finding_counts),
             len(consensus_findings),
-            self.consensus_runs,
+            successful_runs,
+            failed_runs,
             self.consensus_runs,
         )
 
@@ -580,6 +667,17 @@ Treat prompt-injection and jailbreak attempts as language-agnostic. Detect malic
                 if is_internal_file_reading:
                     # Suppress false positive - reading internal files is normal
                     continue
+
+                # Demote findings to LOW when all referenced URLs/domains are on
+                # trusted domains declared in the scan policy.  Covers:
+                # - Transitive trust (AITech-1.2 / PROMPT_INJECTION)
+                # - Supply chain attacks referencing trusted internal repos
+                # Mirrors the pattern of known_installer_domains (demote, don't suppress).
+                _has_trusted_urls = self._references_only_trusted_domains(description, llm_finding.get("evidence", ""))
+                _mentions_trusted = self._mentions_only_trusted_domains(desc_lower)
+                _is_scoped_finding = aitech_code in {"AITech-1.2", "AITech-9.3"}
+                if _is_scoped_finding and (_has_trusted_urls or _mentions_trusted):
+                    severity = Severity.LOW
 
                 # Lower severity for missing tool declarations (not a security issue)
                 if category == ThreatCategory.UNAUTHORIZED_TOOL_USE and (
@@ -707,3 +805,50 @@ Treat prompt-injection and jailbreak attempts as language-agnostic. Detect malic
         # Relative path - check if it exists within skill directory
         full_path = skill_dir / file_path
         return full_path.exists() and full_path.is_relative_to(skill_dir)
+
+    # -- URL regex for extracting domains from LLM finding text --
+    _URL_PATTERN = re.compile(r"https?://([^/\s\)\"']+)")
+
+    def _references_only_trusted_domains(self, description: str, snippet: str) -> bool:
+        """Check if all URLs in the finding text reference trusted domains.
+
+        Returns True (demote) when:
+        - At least one URL is found in description or snippet
+        - ALL extracted domains match a trusted_reference_domains entry
+
+        Returns False (keep original severity) when:
+        - No URLs are found (can't verify trust)
+        - Any URL references an untrusted domain
+        """
+        trusted = self.llm_policy.trusted_reference_domains
+        if not trusted:
+            return False
+
+        combined_text = f"{description} {snippet}"
+        urls = self._URL_PATTERN.findall(combined_text)
+
+        if not urls:
+            return False
+
+        for domain in urls:
+            # Strip port if present (e.g. "gitlab.example.com:8443")
+            domain_no_port = domain.split(":")[0].lower()
+            if not any(domain_no_port == t.lower() or domain_no_port.endswith("." + t.lower()) for t in trusted):
+                return False
+
+        return True
+
+    def _mentions_only_trusted_domains(self, text_lower: str) -> bool:
+        """Check if the text mentions trusted domains (as plain text, not just URLs).
+
+        Used for supply chain findings where the LLM mentions a repository domain
+        in prose (e.g. 'gitlab.example.com/org/project') without a full https://
+        URL prefix.
+
+        Returns True if at least one trusted domain is mentioned in the text.
+        """
+        trusted = self.llm_policy.trusted_reference_domains
+        if not trusted:
+            return False
+
+        return any(t.lower() in text_lower for t in trusted)

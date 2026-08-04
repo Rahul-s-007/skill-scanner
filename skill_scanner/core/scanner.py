@@ -23,15 +23,24 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from ..telemetry import is_enabled, record_analyzer_duration, record_scan_error, record_scan_metrics, scan_span
+from ..telemetry import (
+    is_enabled,
+    record_analyzer_duration,
+    record_scan_error,
+    record_scan_metrics,
+    scan_span,
+)
 from .analyzability import AnalyzabilityReport, compute_analyzability
 from .analyzer_factory import build_core_analyzers
 from .analyzers.base import BaseAnalyzer
+from .analyzers.llm_request_handler import _add_token_usage, _empty_token_usage
 from .extractors.content_extractor import ContentExtractor
 from .loader import SkillLoader, SkillLoadError
 from .models import Finding, Report, ScanResult, Severity, Skill, ThreatCategory
@@ -104,6 +113,11 @@ _STOP_WORDS = frozenset(
 
 class SkillScanner:
     """Main scanner that orchestrates skill analysis."""
+
+    # Upper bound on directories visited during recursive discovery. Guards
+    # against a hostile symlink fan-out (e.g. ``trap -> /``) turning a scan into
+    # a full-filesystem crawl. Far above any realistic skill tree (issue #116).
+    _MAX_WALK_DIRS = 100_000
 
     def __init__(
         self,
@@ -184,6 +198,8 @@ class SkillScanner:
         if not isinstance(skill_directory, Path):
             skill_directory = Path(skill_directory)
 
+        # Review item E: load/parse work gets its own span so "load time" is
+        # separable from "analyze time" in traces.
         with scan_span(
             "skill_scanner.load_skill",
             {"skill.directory": str(skill_directory), "skill.lenient": lenient},
@@ -200,14 +216,13 @@ class SkillScanner:
     # ------------------------------------------------------------------
 
     def _scan_single_skill(self, skill: Skill, skill_directory: Path) -> ScanResult:
-        """Run the full analysis pipeline on a loaded skill.
+        """Open the root scan span and run the analysis pipeline.
 
-        This is the shared implementation that both ``scan_skill`` and
-        ``scan_directory`` delegate to.  It guarantees identical two-phase
-        (non-LLM → LLM w/ enrichment) behaviour regardless of entry point.
+        The pipeline itself lives in :meth:`_run_scan_pipeline`. Keeping the
+        span wrapper in a separate method avoids indenting the entire pipeline
+        inside a ``with`` block, which keeps the telemetry diff small and makes
+        future merges tractable.
         """
-        start_time = time.time()
-
         with scan_span(
             "skill_scanner.scan_skill",
             {
@@ -216,167 +231,18 @@ class SkillScanner:
                 "skill.file_count": len(skill.files),
             },
         ) as root_span:
-            # Pre-processing: Extract archives and add extracted files to skill
-            with scan_span(
-                "skill_scanner.extract_archives",
-                {"skill.name": skill.name, "skill.archive_input_count": len(skill.files)},
-            ) as ext_span:
-                extraction_result = self.content_extractor.extract_skill_archives(skill.files)
-                ext_span.set_attribute("skill.extracted_file_count", len(extraction_result.extracted_files))
-                ext_span.set_attribute("skill.extraction_findings_count", len(extraction_result.findings))
-            if extraction_result.extracted_files:
-                skill.files.extend(extraction_result.extracted_files)
+            result = self._run_scan_pipeline(skill, skill_directory)
 
-            try:
-                # Run all analyzers in two phases:
-                # Phase 1: Non-LLM analyzers (static, pipeline, behavioral, etc.)
-                # Phase 2: LLM analyzers (enriched with Phase 1 context)
-                all_findings: list[Finding] = []
-                # Include any archive extraction findings (zip bombs, path traversal, etc.)
-                all_findings.extend(extraction_result.findings)
-                analyzer_names: list[str] = []
-                analyzers_failed: list[dict[str, str]] = []
-                validated_binary_files: set[str] = set()
-                llm_analyzers: list[BaseAnalyzer] = []
-                unreferenced_scripts: list[str] = []
-                llm_scan_meta: dict[str, Any] = {}
-
-                for analyzer in self.analyzers:
-                    # Defer LLM analyzers to Phase 2
-                    if analyzer.get_name() in ("llm_analyzer", "meta_analyzer"):
-                        llm_analyzers.append(analyzer)
-                        continue
-                    analyzer_start = time.time()
-                    with scan_span(
-                        f"skill_scanner.analyzer.{analyzer.get_name()}",
-                        {"analyzer.name": analyzer.get_name(), "skill.name": skill.name},
-                    ):
-                        findings = analyzer.analyze(skill)
-                    analyzer_duration = time.time() - analyzer_start
-                    record_analyzer_duration(
-                        analyzer.get_name(), analyzer_duration, len(findings), skill.name
-                    )
-                    all_findings.extend(findings)
-                    analyzer_names.append(analyzer.get_name())
-
-                    if hasattr(analyzer, "validated_binary_files"):
-                        validated_binary_files.update(analyzer.validated_binary_files)
-
-                    # Collect unreferenced scripts from the static analyzer for
-                    # LLM enrichment (no longer emitted as standalone findings).
-                    if hasattr(analyzer, "get_unreferenced_scripts"):
-                        unreferenced_scripts = analyzer.get_unreferenced_scripts()
-
-                # Phase 2: Run LLM analyzers with enrichment context from Phase 1
-                if llm_analyzers:
-                    enrichment = self._build_enrichment_context(skill, all_findings, unreferenced_scripts)
-                    for analyzer in llm_analyzers:
-                        if hasattr(analyzer, "set_enrichment_context") and enrichment:
-                            # Build structured enrichment for the LLM
-                            type_counts: dict[str, int] = {}
-                            for sf in skill.files:
-                                type_counts[sf.file_type] = type_counts.get(sf.file_type, 0) + 1
-                            magic_mismatches = [
-                                f.file_path for f in all_findings if f.rule_id and "MAGIC" in f.rule_id and f.file_path
-                            ]
-                            static_summaries = [
-                                f"{f.rule_id}: {f.title}"
-                                for f in all_findings
-                                if f.severity in (Severity.CRITICAL, Severity.HIGH)
-                            ][:10]
-                            analyzer.set_enrichment_context(
-                                file_inventory={
-                                    "total_files": len(skill.files),
-                                    "types": type_counts,
-                                    "unreferenced_scripts": unreferenced_scripts,
-                                },
-                                magic_mismatches=magic_mismatches if magic_mismatches else None,
-                                static_findings_summary=static_summaries if static_summaries else None,
-                            )
-                        analyzer_start = time.time()
-                        with scan_span(
-                            f"skill_scanner.analyzer.{analyzer.get_name()}",
-                            {"analyzer.name": analyzer.get_name(), "skill.name": skill.name, "phase": "llm"},
-                        ):
-                            findings = analyzer.analyze(skill)
-                        analyzer_duration = time.time() - analyzer_start
-                        record_analyzer_duration(
-                            analyzer.get_name(), analyzer_duration, len(findings), skill.name
-                        )
-                        all_findings.extend(findings)
-                        analyzer_names.append(analyzer.get_name())
-
-                        # Track analyzer failures for machine-readable output
-                        if hasattr(analyzer, "last_error") and analyzer.last_error:
-                            analyzers_failed.append({"analyzer": analyzer.get_name(), "error": analyzer.last_error})
-
-                        # Capture skill-level LLM assessment for scan_metadata
-                        if hasattr(analyzer, "last_overall_assessment"):
-                            llm_scan_meta["llm_overall_assessment"] = analyzer.last_overall_assessment
-                            llm_scan_meta["llm_primary_threats"] = getattr(analyzer, "last_primary_threats", [])
-
-                # Post-process findings: Suppress BINARY_FILE_DETECTED for VirusTotal-validated files
-                if validated_binary_files:
-                    filtered_findings = []
-                    for finding in all_findings:
-                        if finding.rule_id == "BINARY_FILE_DETECTED" and finding.file_path in validated_binary_files:
-                            continue
-                        filtered_findings.append(finding)
-                    all_findings = filtered_findings
-
-                # Global safety net: enforce disabled_rules across ALL analyzers
-                if self.policy.disabled_rules:
-                    all_findings = [f for f in all_findings if f.rule_id not in self.policy.disabled_rules]
-
-                # Apply severity overrides from policy
-                self._apply_severity_overrides(all_findings)
-
-                # Compute analyzability score
-                analyzability = compute_analyzability(skill, policy=self.policy)
-
-                # Generate findings from low analyzability (fail-closed posture)
-                all_findings.extend(self._analyzability_findings(analyzability))
-
-                # Normalize duplicate findings at final output stage (policy-controlled).
-                all_findings = self._normalize_findings(all_findings)
-
-                # Attach same-path rule co-occurrence metadata (policy-controlled).
-                self._annotate_same_path_rule_cooccurrence(all_findings)
-
-                # Attach policy fingerprint metadata for traceability (policy-controlled).
-                policy_meta = self._policy_fingerprint_metadata()
-                if llm_scan_meta:
-                    policy_meta.update(llm_scan_meta)
-                self._annotate_findings_with_policy(all_findings, policy_meta)
-
-            finally:
-                # Always cleanup temporary extraction directories, even if an
-                # analyzer raises an exception, to avoid leaking temp files.
-                self.content_extractor.cleanup()
-
-            scan_duration = time.time() - start_time
-
-            result = ScanResult(
-                skill_name=skill.name,
-                skill_directory=str(skill_directory.absolute()),
-                findings=all_findings,
-                scan_duration_seconds=scan_duration,
-                analyzers_used=analyzer_names,
-                analyzers_failed=analyzers_failed,
-                analyzability_score=analyzability.score,
-                analyzability_details=analyzability.to_dict(),
-                scan_metadata=policy_meta,
-            )
-
-            # Enrich the root span with final result attributes and emit metrics
-            root_span.set_attribute("findings.total", len(all_findings))
+            # Enrich the root span with final result attributes.
+            root_span.set_attribute("findings.total", len(result.findings))
             root_span.set_attribute("findings.is_safe", result.is_safe)
-            root_span.set_attribute("scan.duration_seconds", scan_duration)
-            root_span.set_attribute("analyzers.used", ",".join(analyzer_names))
+            root_span.set_attribute("scan.duration_seconds", result.scan_duration_seconds)
+            root_span.set_attribute("analyzers.used", ",".join(result.analyzers_used))
 
             if is_enabled():
-                # Embed trace/span IDs in the result so CI pipelines and API consumers
-                # can correlate scan output directly with traces in the backend.
+                # Review item H: embed trace/span IDs in the result so CI
+                # pipelines and API consumers can correlate scan output with
+                # traces in their backend.
                 try:
                     from opentelemetry import trace as _otel_trace
 
@@ -384,25 +250,262 @@ class SkillScanner:
                     if span_ctx.is_valid:
                         result.scan_metadata["trace_id"] = format(span_ctx.trace_id, "032x")
                         result.scan_metadata["span_id"] = format(span_ctx.span_id, "016x")
-                except Exception:
+                except Exception:  # pragma: no cover - defensive, never break a scan
                     pass
 
-            if is_enabled():
                 findings_by_severity = {
-                    sev.value: sum(1 for f in all_findings if f.severity == sev)
+                    sev.value: sum(1 for f in result.findings if f.severity == sev)
                     for sev in Severity
                     if sev != Severity.SAFE
                 }
                 record_scan_metrics(
                     skill_name=skill.name,
-                    duration_seconds=scan_duration,
-                    findings_count=len(all_findings),
+                    duration_seconds=result.scan_duration_seconds,
+                    findings_count=len(result.findings),
                     findings_by_severity=findings_by_severity,
-                    analyzers_used=analyzer_names,
+                    analyzers_used=result.analyzers_used,
                     is_safe=result.is_safe,
                 )
 
             return result
+
+    def _run_scan_pipeline(self, skill: Skill, skill_directory: Path) -> ScanResult:
+        """Run the full analysis pipeline on a loaded skill.
+
+        This is the shared implementation that both ``scan_skill`` and
+        ``scan_directory`` delegate to.  It guarantees identical two-phase
+        (non-LLM → LLM w/ enrichment) behaviour regardless of entry point.
+        """
+        start_time = time.time()
+
+        # Pre-processing: Extract archives and add extracted files to skill.
+        # Review item F: extraction is significant I/O (zip, tar, Office files)
+        # and was previously invisible in traces.
+        with scan_span(
+            "skill_scanner.extract_archives",
+            {"skill.name": skill.name, "skill.archive_input_count": len(skill.files)},
+        ) as ext_span:
+            extraction_result = self.content_extractor.extract_skill_archives(skill.files)
+            ext_span.set_attribute("skill.extracted_file_count", len(extraction_result.extracted_files))
+            ext_span.set_attribute("skill.extraction_findings_count", len(extraction_result.findings))
+
+        if extraction_result.extracted_files:
+            skill.files.extend(extraction_result.extracted_files)
+
+        try:
+            # Run all analyzers in two phases:
+            # Phase 1: Non-LLM analyzers (static, pipeline, behavioral, etc.)
+            # Phase 2: LLM analyzers (enriched with Phase 1 context)
+            all_findings: list[Finding] = []
+            # Include any archive extraction findings (zip bombs, path traversal, etc.)
+            all_findings.extend(extraction_result.findings)
+            analyzer_names: list[str] = []
+            analyzers_failed: list[dict[str, str]] = []
+            validated_binary_files: set[str] = set()
+            llm_analyzers: list[BaseAnalyzer] = []
+            unreferenced_scripts: list[str] = []
+            llm_scan_meta: dict[str, Any] = {}
+            llm_usage: dict[str, int] | None = None
+
+            for analyzer in self.analyzers:
+                # Defer LLM analyzers to Phase 2
+                if analyzer.get_name() in ("llm_analyzer", "meta_analyzer"):
+                    llm_analyzers.append(analyzer)
+                    continue
+                analyzer_start = time.time()
+                with scan_span(
+                    f"skill_scanner.analyzer.{analyzer.get_name()}",
+                    {"analyzer.name": analyzer.get_name(), "skill.name": skill.name},
+                ):
+                    findings = analyzer.analyze(skill)
+                record_analyzer_duration(analyzer.get_name(), time.time() - analyzer_start, len(findings), skill.name)
+                all_findings.extend(findings)
+                analyzer_names.append(analyzer.get_name())
+
+                if hasattr(analyzer, "validated_binary_files"):
+                    validated_binary_files.update(analyzer.validated_binary_files)
+
+                # Collect unreferenced scripts from the static analyzer for
+                # LLM enrichment (no longer emitted as standalone findings).
+                if hasattr(analyzer, "get_unreferenced_scripts"):
+                    unreferenced_scripts = analyzer.get_unreferenced_scripts()
+
+            # Phase 1.5: Per-finding adjudicator (demote literal-regex FPs)
+            #
+            # Runs before the LLM analyzer so that demoted findings never
+            # enter the LLM analyzer's ``static_findings_summary`` enrichment
+            # context.  This naturally breaks the cross-analyzer confirmation
+            # cascade where a wrong deterministic HIGH gets amplified into
+            # LLM findings citing the same pattern hit.
+            #
+            # Demote-only: findings can only be lowered in severity, never
+            # raised. LLM errors leave findings at their original severity,
+            # so enabling this pass cannot introduce false negatives.
+            adjudicator_audit: list[dict[str, Any]] = []
+            adjudicator_usage = _empty_token_usage()
+            if self.policy.adjudicator.enabled and all_findings:
+                try:
+                    from .analyzers.adjudicator import Adjudicator
+
+                    adj = Adjudicator(
+                        min_fp_confidence=self.policy.adjudicator.min_fp_confidence,
+                    )
+                    try:
+                        if adj.is_available():
+                            adj.adjudicate(all_findings, skill)
+                            analyzer_names.append("adjudicator")
+                            adjudicator_audit = [
+                                {
+                                    "rule_id": r.rule_id,
+                                    "verdict": r.verdict,
+                                    "confidence": r.confidence,
+                                    "reason": r.reason,
+                                    "demoted_to": r.demoted_to,
+                                    "model_id": r.model_id,
+                                }
+                                for r in adj.audit
+                            ]
+                        else:
+                            logger.debug(
+                                "adjudicator enabled but no LLM model configured; "
+                                "set SKILL_SCANNER_LLM_MODEL or "
+                                "SKILL_SCANNER_ADJUDICATOR_LLM_MODEL to activate"
+                            )
+                    finally:
+                        # Preserve billed usage even if a later adjudication
+                        # step raises and findings remain fail-closed.
+                        _add_token_usage(adjudicator_usage, adj.llm_usage)
+                except Exception as exc:
+                    logger.warning("Adjudication failed: %s", exc)
+
+            # Phase 2: Run LLM analyzers with enrichment context from Phase 1
+            if llm_analyzers:
+                enrichment = self._build_enrichment_context(skill, all_findings, unreferenced_scripts)
+                for analyzer in llm_analyzers:
+                    if hasattr(analyzer, "set_enrichment_context") and enrichment:
+                        # Build structured enrichment for the LLM
+                        type_counts: dict[str, int] = {}
+                        for sf in skill.files:
+                            type_counts[sf.file_type] = type_counts.get(sf.file_type, 0) + 1
+                        magic_mismatches = [
+                            f.file_path for f in all_findings if f.rule_id and "MAGIC" in f.rule_id and f.file_path
+                        ]
+                        static_summaries = [
+                            f"{f.rule_id}: {f.title}"
+                            for f in all_findings
+                            if f.severity in (Severity.CRITICAL, Severity.HIGH)
+                        ][:10]
+                        analyzer.set_enrichment_context(
+                            file_inventory={
+                                "total_files": len(skill.files),
+                                "types": type_counts,
+                                "unreferenced_scripts": unreferenced_scripts,
+                            },
+                            magic_mismatches=magic_mismatches if magic_mismatches else None,
+                            static_findings_summary=static_summaries if static_summaries else None,
+                        )
+                    analyzer_start = time.time()
+                    with scan_span(
+                        f"skill_scanner.analyzer.{analyzer.get_name()}",
+                        {
+                            "analyzer.name": analyzer.get_name(),
+                            "skill.name": skill.name,
+                            "phase": "llm",
+                        },
+                    ):
+                        findings = analyzer.analyze(skill)
+                    record_analyzer_duration(
+                        analyzer.get_name(), time.time() - analyzer_start, len(findings), skill.name
+                    )
+                    all_findings.extend(findings)
+                    analyzer_names.append(analyzer.get_name())
+
+                    # Track analyzer failures for machine-readable output.
+                    # Review item C: analyzers that set ``last_error`` instead of
+                    # raising were previously invisible in traces.
+                    if hasattr(analyzer, "last_error") and analyzer.last_error:
+                        analyzers_failed.append({"analyzer": analyzer.get_name(), "error": analyzer.last_error})
+                        record_scan_error(
+                            skill_directory=str(skill_directory),
+                            error_type="analyzer_error",
+                            reason=f"{analyzer.get_name()}: {analyzer.last_error}",
+                        )
+
+                    # Capture skill-level LLM assessment for scan_metadata
+                    if hasattr(analyzer, "last_overall_assessment"):
+                        llm_scan_meta["llm_overall_assessment"] = analyzer.last_overall_assessment
+                        llm_scan_meta["llm_primary_threats"] = getattr(analyzer, "last_primary_threats", [])
+
+            # Aggregate token usage across all LLM analyzers that ran.
+            aggregated_usage = _empty_token_usage()
+            _add_token_usage(aggregated_usage, adjudicator_usage)
+            for analyzer in llm_analyzers:
+                if hasattr(analyzer, "llm_usage"):
+                    _add_token_usage(aggregated_usage, analyzer.llm_usage)
+            llm_usage = dict(aggregated_usage) if any(aggregated_usage.values()) else None  # type: ignore[arg-type]
+
+            # Post-process findings: Suppress BINARY_FILE_DETECTED for VirusTotal-validated files
+            if validated_binary_files:
+                filtered_findings = []
+                for finding in all_findings:
+                    if finding.rule_id == "BINARY_FILE_DETECTED" and finding.file_path in validated_binary_files:
+                        continue
+                    filtered_findings.append(finding)
+                all_findings = filtered_findings
+
+            # Global safety net: enforce disabled_rules across ALL analyzers
+            if self.policy.disabled_rules:
+                all_findings = [f for f in all_findings if f.rule_id not in self.policy.disabled_rules]
+
+            # Apply severity overrides from policy
+            self._apply_severity_overrides(all_findings)
+
+            # Compute analyzability score
+            analyzability = compute_analyzability(skill, policy=self.policy)
+
+            # Generate findings from low analyzability (fail-closed posture)
+            all_findings.extend(self._analyzability_findings(analyzability))
+
+            # Normalize duplicate findings at final output stage (policy-controlled).
+            all_findings = self._normalize_findings(all_findings)
+
+            # Attach same-path rule co-occurrence metadata (policy-controlled).
+            self._annotate_same_path_rule_cooccurrence(all_findings)
+
+            # Attach policy fingerprint metadata for traceability (policy-controlled).
+            policy_meta = self._policy_fingerprint_metadata()
+            if llm_scan_meta:
+                policy_meta.update(llm_scan_meta)
+            if adjudicator_audit:
+                demoted = [a for a in adjudicator_audit if a.get("demoted_to")]
+                policy_meta["adjudicator"] = {
+                    "considered": len(adjudicator_audit),
+                    "demoted": len(demoted),
+                    "audit": adjudicator_audit,
+                }
+            self._annotate_findings_with_policy(all_findings, policy_meta)
+
+        finally:
+            # Always cleanup temporary extraction directories, even if an
+            # analyzer raises an exception, to avoid leaking temp files.
+            self.content_extractor.cleanup()
+
+        scan_duration = time.time() - start_time
+
+        result = ScanResult(
+            skill_name=skill.name,
+            skill_directory=str(skill_directory.absolute()),
+            findings=all_findings,
+            scan_duration_seconds=scan_duration,
+            analyzers_used=analyzer_names,
+            analyzers_failed=analyzers_failed,
+            analyzability_score=analyzability.score,
+            analyzability_details=analyzability.to_dict(),
+            scan_metadata=policy_meta,
+            llm_usage=llm_usage,
+        )
+
+        return result
 
     def _analyzability_findings(self, report: AnalyzabilityReport) -> list[Finding]:
         """Generate findings when analyzability score is below acceptable thresholds.
@@ -523,8 +626,16 @@ class SkillScanner:
         return has_critical_or_high or has_unreferenced or has_magic_mismatch
 
     def _apply_severity_overrides(self, findings: list) -> None:
-        """Apply severity overrides from policy ``severity_overrides``."""
+        """Apply severity overrides from policy ``severity_overrides``.
+
+        Findings previously demoted by the adjudicator (marked with
+        ``metadata['adjudication']['demoted_to']``) are exempt — the
+        adjudicator's INFO verdict is load-bearing for downstream verdict
+        computation and must not be re-raised by a per-rule override.
+        """
         for finding in findings:
+            if (finding.metadata or {}).get("adjudication", {}).get("demoted_to"):
+                continue
             override = self.policy.get_severity_override(finding.rule_id)
             if override:
                 try:
@@ -751,6 +862,7 @@ class SkillScanner:
         check_overlap: bool = False,
         *,
         lenient: bool = False,
+        skill_file: str | None = None,
     ) -> Report:
         """
         Scan all skill packages in a directory.
@@ -764,6 +876,9 @@ class SkillScanner:
             recursive: If True, search recursively for SKILL.md files
             check_overlap: If True, check for description overlap between skills
             lenient: Tolerate malformed YAML / missing fields in skills.
+                When True, directories containing ``.md`` files (but no
+                ``SKILL.md``) are also discovered as candidate skills.
+            skill_file: Optional custom metadata filename (e.g. ``"README.md"``).
 
         Returns:
             Report with results from all skills
@@ -774,7 +889,7 @@ class SkillScanner:
         if not skills_directory.exists():
             raise FileNotFoundError(f"Directory does not exist: {skills_directory}")
 
-        skill_dirs = self._find_skill_directories(skills_directory, recursive)
+        skill_dirs = self._find_skill_directories(skills_directory, recursive, lenient=lenient, skill_file=skill_file)
 
         with scan_span(
             "skill_scanner.scan_directory",
@@ -792,13 +907,15 @@ class SkillScanner:
 
             for skill_dir in skill_dirs:
                 try:
-                    skill = self.loader.load_skill(skill_dir, lenient=lenient)
+                    skill = self.loader.load_skill(skill_dir, lenient=lenient, skill_file=skill_file)
                     result = self._scan_single_skill(skill, skill_dir)
                     report.add_scan_result(result)
 
                     if check_overlap:
                         loaded_skills.append(skill)
 
+                # Review item C: skipped skills previously vanished from traces.
+                # Record them as span events plus an error-counter increment.
                 except SkillLoadError as e:
                     logger.warning("Failed to load %s: %s", skill_dir, e)
                     report.skills_skipped.append({"skill": str(skill_dir), "reason": str(e)})
@@ -834,9 +951,11 @@ class SkillScanner:
                     overlap_findings = self._check_description_overlap(loaded_skills)
                 except Exception as e:
                     logger.error("Cross-skill description overlap check failed: %s", e)
-                    dir_span.add_event(
-                        "cross_skill_overlap_check_failed",
-                        {"error": str(e)},
+                    dir_span.add_event("cross_skill_overlap_check_failed", {"error": str(e)})
+                    record_scan_error(
+                        skill_directory=str(skills_directory),
+                        error_type="cross_skill_error",
+                        reason=str(e),
                     )
 
                 try:
@@ -848,15 +967,17 @@ class SkillScanner:
                     pass
                 except Exception as e:
                     logger.error("Cross-skill pattern detection failed: %s", e)
-                    dir_span.add_event(
-                        "cross_skill_scan_failed",
-                        {"error": str(e)},
+                    dir_span.add_event("cross_skill_pattern_detection_failed", {"error": str(e)})
+                    record_scan_error(
+                        skill_directory=str(skills_directory),
+                        error_type="cross_skill_error",
+                        reason=str(e),
                     )
 
             if overlap_findings or cross_findings:
                 all_cross_findings = list(overlap_findings or []) + list(cross_findings or [])
                 if all_cross_findings:
-                    # Apply policy filters to cross-skill findings (mirrors _scan_single_skill lines 279-283)
+                    # Apply policy filters to cross-skill findings (mirrors _run_scan_pipeline)
                     if self.policy.disabled_rules:
                         all_cross_findings = [
                             f for f in all_cross_findings if f.rule_id not in self.policy.disabled_rules
@@ -864,10 +985,8 @@ class SkillScanner:
                     self._apply_severity_overrides(all_cross_findings)
                     report.add_cross_skill_findings(all_cross_findings)
 
-            dir_span.set_attribute("report.total_skills", report.total_skills_scanned)
-            dir_span.set_attribute("report.total_findings", report.total_findings)
-            dir_span.set_attribute("report.safe_count", report.safe_count)
-            dir_span.set_attribute("report.skills_skipped", len(report.skills_skipped))
+            dir_span.set_attribute("skills.scanned", len(report.scan_results))
+            dir_span.set_attribute("skills.skipped", len(report.skills_skipped))
 
             return report
 
@@ -967,28 +1086,143 @@ class SkillScanner:
 
         return intersection / union if union > 0 else 0.0
 
-    def _find_skill_directories(self, directory: Path, recursive: bool) -> list[Path]:
+    def _walk_skill_dirs(self, directory: Path) -> Iterator[Path]:
+        """Yield *directory* and every subdirectory beneath it, descending
+        into symlinked directories as well.
+
+        ``Path.rglob`` / ``Path.glob("**")`` do not follow directory symlinks
+        (and on Python < 3.13 there is no option to make them), so skills
+        installed as symlinks are silently skipped during recursive discovery.
+        This is the standard Claude Code layout, where ``~/.claude/skills/<name>``
+        is a symlink to a real directory elsewhere (issue #116).  ``os.walk``
+        with ``followlinks=True`` descends into them.
+
+        Following symlinks is deliberately bounded so a security scan cannot be
+        turned against the user (issue #116 review):
+
+        * **Containment.** When the walk crosses a symlink whose real target is
+          *outside* the scan root, that directory itself is still yielded (so a
+          per-skill symlink such as ``~/.claude/skills/<name>`` -- which points
+          directly at a leaf skill with its ``SKILL.md`` at depth 0 -- is
+          discovered), but its children are not descended into. This stops a
+          hostile bundle whose ``trap -> /`` (or ``-> ~``) symlink would
+          otherwise make discovery crawl the entire filesystem.
+
+          Limitation: because descent stops at the crossing, a symlink pointing
+          at an external *collection* of skills (e.g. ``skills -> /ext/skillset``
+          with skills nested at ``skillset/a``, ``skillset/group/b``) only has
+          its top level evaluated; nested skills underneath are not discovered.
+          This is not a regression -- ``rglob`` followed no symlinks at all -- and
+          the standard #116 layout (one symlink per skill) is unaffected. To scan
+          such a collection, point the scanner directly at the resolved directory.
+        * **Cycle safety.** Resolved paths are tracked so symlink cycles and
+          aliases are walked at most once.
+        * **DoS backstop.** Discovery stops after ``_MAX_WALK_DIRS`` directories,
+          logging the truncation. Note this bounds the *number of directories*
+          walked, not the entry count within a single directory: ``os.walk``
+          still materializes one directory's full listing at a time, so a symlink
+          to a single directory with an enormous number of entries is not bounded
+          by this cap.
         """
-        Find all directories containing SKILL.md files.
+        try:
+            scan_root = directory.resolve()
+        except OSError:
+            return
+        visited: set[Path] = set()
+        for root, dirs, _files in os.walk(directory, followlinks=True):
+            if len(visited) >= self._MAX_WALK_DIRS:
+                logger.warning(
+                    "Skill discovery truncated at %d directories under %s "
+                    "(possible symlink fan-out); some skills may be skipped.",
+                    self._MAX_WALK_DIRS,
+                    directory,
+                )
+                break
+            root_path = Path(root)
+            try:
+                real = root_path.resolve()
+            except OSError:
+                # Symlink loop / unreadable entry: do not descend further.
+                dirs[:] = []
+                continue
+            if real in visited:
+                # Already walked this real directory (symlink cycle or alias).
+                dirs[:] = []
+                continue
+            visited.add(real)
+            yield root_path
+            if not real.is_relative_to(scan_root):
+                # Followed a symlink out of the scan root: evaluate this
+                # directory as a skill, but do not wander into its external
+                # siblings/children (containment, see docstring).
+                dirs[:] = []
+
+    def _find_skill_directories(
+        self,
+        directory: Path,
+        recursive: bool,
+        *,
+        lenient: bool = False,
+        skill_file: str | None = None,
+    ) -> list[Path]:
+        """
+        Find all directories containing skill metadata files.
+
+        When *lenient* is True and no ``SKILL.md`` (or *skill_file*) is found,
+        directories containing at least one ``.md`` file are also treated as
+        candidate skills.  This enables scanning non-Codex/Cursor formats such
+        as Claude Code ``.claude/commands/*.md`` or flat markdown skill repos.
 
         Args:
             directory: Directory to search
             recursive: Search recursively
+            lenient: Also discover directories with ``.md`` files (no ``SKILL.md``)
+            skill_file: Custom metadata filename to look for instead of ``SKILL.md``
 
         Returns:
             List of skill directory paths
         """
-        skill_dirs = []
+        target_filename = skill_file or "SKILL.md"
+        skill_dirs: list[Path] = []
+        seen: set[Path] = set()
 
+        # Phase 1: find directories with the target metadata file
         if recursive:
-            for skill_md in directory.rglob("SKILL.md"):
-                skill_dirs.append(skill_md.parent)
+            for sub in self._walk_skill_dirs(directory):
+                if (sub / target_filename).exists():
+                    resolved = sub.resolve()
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        skill_dirs.append(sub)
         else:
             for item in directory.iterdir():
                 if item.is_dir():
-                    skill_md = item / "SKILL.md"
-                    if skill_md.exists():
-                        skill_dirs.append(item)
+                    md = item / target_filename
+                    if md.exists():
+                        resolved = item.resolve()
+                        if resolved not in seen:
+                            seen.add(resolved)
+                            skill_dirs.append(item)
+
+        # Phase 2 (lenient only): discover directories with .md files
+        if lenient:
+            if recursive:
+                for sub in self._walk_skill_dirs(directory):
+                    candidate = sub.resolve()
+                    if candidate in seen:
+                        continue
+                    if any(sub.glob("*.md")):
+                        seen.add(candidate)
+                        skill_dirs.append(sub)
+            else:
+                for item in directory.iterdir():
+                    if item.is_dir():
+                        resolved = item.resolve()
+                        if resolved in seen:
+                            continue
+                        if any(item.glob("*.md")):
+                            seen.add(resolved)
+                            skill_dirs.append(item)
 
         return skill_dirs
 

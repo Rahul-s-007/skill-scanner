@@ -18,6 +18,7 @@
 Skill package loader and SKILL.md parser.
 """
 
+import json
 import logging
 import re
 import sys
@@ -30,6 +31,13 @@ from .exceptions import SkillLoadError
 from .models import Skill, SkillFile, SkillManifest
 
 logger = logging.getLogger(__name__)
+
+_FRONTMATTER_QUOTE_RE = re.compile(r'^(description|name):[^\S\n]+(?!["\'])(.*:.*)$', re.MULTILINE)
+
+
+def _quote_frontmatter_scalar(match: re.Match[str]) -> str:
+    """Quote a YAML scalar while preserving literal backslashes and quotes."""
+    return f"{match.group(1)}: {json.dumps(match.group(2), ensure_ascii=False)}"
 
 
 class SkillLoader:
@@ -191,6 +199,12 @@ class SkillLoader:
             SkillLoadError: If parsing fails (strict mode only)
         """
         content = self._read_skill_text_file(skill_md_path)
+
+        if "---" in content:
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                fm = _FRONTMATTER_QUOTE_RE.sub(_quote_frontmatter_scalar, parts[1])
+                content = f"---{fm}---{parts[2]}"
 
         # Parse with python-frontmatter
         try:

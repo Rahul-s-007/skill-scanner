@@ -12,7 +12,7 @@ All versions from [`pyproject.toml`](https://github.com/cisco-ai-defense/skill-s
 | `uvicorn[standard]` | >= 0.29.0 | ASGI server |
 | `pydantic` | >= 2.6.0 | Data validation and serialization |
 | `python-multipart` | >= 0.0.6 | File upload handling |
-| `httpx` | >= 0.28.1 | Async HTTP client |
+| `httpx` | >= 0.28.1 | HTTP client (also used by the VirusTotal, AI Defense, and OSV external analyzers) |
 
 ### CLI and TUI
 
@@ -90,11 +90,14 @@ Set `SKILL_SCANNER_LLM_MODEL` using the provider prefix convention:
 |----------|--------------|-------|
 | Anthropic | `anthropic/claude-sonnet-4-20250514` | Default provider |
 | OpenAI | `openai/gpt-4o` | |
+| OpenAI-compatible custom endpoint | `Cloud-Gemini-3.1-Pro` with `SKILL_SCANNER_LLM_PROVIDER=openai` | Uses `SKILL_SCANNER_LLM_BASE_URL` |
 | AWS Bedrock | `bedrock/anthropic.claude-sonnet-4-20250514-v1:0` | Requires `[bedrock]` extra or API key |
 | Google Vertex AI | `vertex_ai/gemini-2.5-pro` | Requires `[vertex]` extra |
 | Google AI Studio | `gemini/gemini-2.5-flash` | Requires `[google]` extra |
 | Azure OpenAI | `azure/my-deployment-name` | Requires `[azure]` extra |
 | Ollama (local) | `ollama/llama3` | No API key needed |
+
+For OpenAI and OpenAI-compatible custom endpoints, `SKILL_SCANNER_LLM_USER` can set the raw Chat Completions `user` request field. The value is passed through unchanged and is ignored for non-OpenAI routes.
 
 ### Authentication
 
@@ -102,9 +105,11 @@ Set `SKILL_SCANNER_LLM_MODEL` using the provider prefix convention:
 |----------|-------------|-------------------|
 | Anthropic | API key | `SKILL_SCANNER_LLM_API_KEY` |
 | OpenAI | API key | `SKILL_SCANNER_LLM_API_KEY` |
+| OpenAI-compatible custom endpoint | API key + endpoint | `SKILL_SCANNER_LLM_API_KEY`, `SKILL_SCANNER_LLM_PROVIDER=openai`, `SKILL_SCANNER_LLM_BASE_URL` |
 | AWS Bedrock (API key) | API key | `SKILL_SCANNER_LLM_API_KEY` |
 | AWS Bedrock (IAM) | AWS credentials | `AWS_REGION`, `AWS_PROFILE` (optional: `AWS_SESSION_TOKEN`) |
-| Google Vertex AI | Service account | `GOOGLE_APPLICATION_CREDENTIALS` |
+| Google Vertex AI (service account) | Service account key file | `GOOGLE_APPLICATION_CREDENTIALS` |
+| Google Vertex AI (ambient ADC) | Workload Identity / attached service account | none -- falls back automatically, like Bedrock IAM |
 | Google AI Studio | API key | `SKILL_SCANNER_LLM_API_KEY` (auto-sets `GEMINI_API_KEY`) |
 | Azure OpenAI | API key + endpoint | `SKILL_SCANNER_LLM_API_KEY`, `SKILL_SCANNER_LLM_BASE_URL`, `SKILL_SCANNER_LLM_API_VERSION` |
 | Ollama | None | — |

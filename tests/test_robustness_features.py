@@ -180,6 +180,73 @@ class TestLenientLoader:
         skill = loader.load_skill(tmp_path / "dict-name")
         assert isinstance(skill.name, str)
 
+    def test_colon_in_description_value(self, tmp_path):
+        """Description values containing ': ' should not crash the YAML parser."""
+        _write_skill_md(
+            tmp_path / "colon-desc",
+            """\
+            ---
+            name: colon-skill
+            description: This does X: more text here
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-desc")
+        assert skill.name == "colon-skill"
+        assert "more text" in skill.description
+
+    def test_colon_in_name_value(self, tmp_path):
+        """Name values containing ': ' should not crash the YAML parser."""
+        _write_skill_md(
+            tmp_path / "colon-name",
+            """\
+            ---
+            name: evil: skill
+            description: test
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-name")
+        assert "evil" in skill.name
+
+    def test_colon_with_embedded_quotes(self, tmp_path):
+        """Value with both ': ' and embedded double quotes should round-trip."""
+        _write_skill_md(
+            tmp_path / "colon-quote",
+            """\
+            ---
+            name: test
+            description: He said "hello": then left
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-quote")
+        assert "hello" in skill.description
+        assert "then left" in skill.description
+
+    def test_colon_value_with_backslashes(self, tmp_path):
+        """Auto-quoted values must preserve literal backslashes."""
+        _write_skill_md(
+            tmp_path / "colon-backslash",
+            """\
+            ---
+            name: test
+            description: Windows path C:\\temp\\data: keep backslashes
+            ---
+            body
+            """,
+        )
+        loader = SkillLoader()
+        skill = loader.load_skill(tmp_path / "colon-backslash")
+        assert "C:\\temp\\data" in skill.description
+        assert "keep backslashes" in skill.description
+
     def test_no_skill_md_still_raises_in_lenient(self, tmp_path):
         """Even in lenient mode, a completely empty dir (no .md files) is fatal."""
         empty_dir = tmp_path / "empty"
@@ -370,10 +437,10 @@ class TestPrecommitGetAffectedSkills:
     def test_detects_skill_under_configured_path(self):
         from skill_scanner.hooks.pre_commit import get_affected_skills
 
-        # Path.exists is patched so no real filesystem setup is needed;
+        # Path.is_file is patched so no real filesystem setup is needed;
         # this avoids sandbox restrictions on creating ".cursor" directories.
         staged = [".cursor/skills/my-skill/scripts/run.py"]
-        with patch("pathlib.Path.exists", return_value=True):
+        with patch("pathlib.Path.is_file", return_value=True):
             result = get_affected_skills(staged, ".cursor/skills")
         assert len(result) >= 1
 

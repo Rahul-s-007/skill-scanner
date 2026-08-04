@@ -39,8 +39,11 @@ except ImportError:
     HTTPX_AVAILABLE = False
 
 from ...core.models import Finding, Severity, Skill, ThreatCategory
+from ...telemetry import external_span, record_external_error, record_external_retry
 from ...threats.threats import ThreatMapping
 from .base import BaseAnalyzer
+
+_AIDEFENSE_SERVICE = "aidefense"
 
 logger = logging.getLogger(__name__)
 
@@ -593,7 +596,13 @@ class AIDefenseAnalyzer(BaseAnalyzer):
 
         for attempt in range(self.max_retries):
             try:
-                response = await client.post(url, json=payload)
+                with external_span(
+                    _AIDEFENSE_SERVICE,
+                    "inspect",
+                    {"http.url": url, "external.attempt": attempt + 1},
+                ) as span:
+                    response = await client.post(url, json=payload)
+                    span.set_attribute("http.status_code", response.status_code)
 
                 if response.status_code == 200:
                     return cast(dict[str, Any], response.json())
@@ -617,6 +626,7 @@ class AIDefenseAnalyzer(BaseAnalyzer):
                             )
                             payload = payload_without_rules
                             tried_without_rules = True
+                            record_external_retry(_AIDEFENSE_SERVICE, "preconfigured_rules", operation="inspect")
                             continue
                     except (ValueError, KeyError, json.JSONDecodeError):
                         # Can't parse error, fall through to generic error handling
@@ -624,29 +634,39 @@ class AIDefenseAnalyzer(BaseAnalyzer):
 
                     # Generic 400 error
                     logger.error("AI Defense API error: %s - %s", response.status_code, response.text)
+                    record_external_error(_AIDEFENSE_SERVICE, "http_400", operation="inspect")
                     return None
                 elif response.status_code == 429:
                     # Rate limited - wait and retry
                     delay = (2**attempt) * 1.0
                     logger.warning("AI Defense API rate limited, retrying in %ds...", delay)
+                    record_external_error(_AIDEFENSE_SERVICE, "rate_limit", operation="inspect")
+                    record_external_retry(_AIDEFENSE_SERVICE, "rate_limit", operation="inspect")
                     await asyncio.sleep(delay)
                     continue
                 elif response.status_code == 401:
+                    record_external_error(_AIDEFENSE_SERVICE, "auth_failure", operation="inspect")
                     raise ValueError("Invalid AI Defense API key")
                 elif response.status_code == 403:
+                    record_external_error(_AIDEFENSE_SERVICE, "auth_failure", operation="inspect")
                     raise ValueError("AI Defense API access denied - check permissions")
                 else:
                     logger.error("AI Defense API error: %s - %s", response.status_code, response.text)
+                    record_external_error(_AIDEFENSE_SERVICE, f"http_{response.status_code}", operation="inspect")
                     return None
 
             except httpx.TimeoutException:
                 last_exception = TimeoutError(f"AI Defense API timeout after {self.timeout}s")
+                record_external_error(_AIDEFENSE_SERVICE, "timeout", operation="inspect")
                 if attempt < self.max_retries - 1:
+                    record_external_retry(_AIDEFENSE_SERVICE, "timeout", operation="inspect")
                     await asyncio.sleep(1.0)
                     continue
             except httpx.RequestError as e:
                 last_exception = e
+                record_external_error(_AIDEFENSE_SERVICE, type(e).__name__, operation="inspect")
                 if attempt < self.max_retries - 1:
+                    record_external_retry(_AIDEFENSE_SERVICE, "request_error", operation="inspect")
                     await asyncio.sleep(1.0)
                     continue
 

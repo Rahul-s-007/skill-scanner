@@ -29,6 +29,11 @@ The client manages:
 import asyncio
 import logging
 import os
+from typing import Any
+
+from .....telemetry import external_span, record_external_error, record_external_retry
+from ...llm_request_handler import _TEMPERATURE_UNSET, _resolve_temperature
+from ...llm_request_options import resolve_llm_user, supports_openai_user_param
 
 try:
     from litellm import acompletion
@@ -60,7 +65,8 @@ class AlignmentLLMClient:
         api_key: str | None = None,
         base_url: str | None = None,
         api_version: str | None = None,
-        temperature: float = 0.1,
+        llm_user: str | None = None,
+        temperature: Any = _TEMPERATURE_UNSET,
         max_tokens: int = 4096,
         timeout: int = 120,
     ):
@@ -71,7 +77,12 @@ class AlignmentLLMClient:
             api_key: API key (or resolved from environment)
             base_url: Optional base URL for API
             api_version: Optional API version
-            temperature: Temperature for responses
+            llm_user: Optional raw Chat Completions user field for OpenAI-compatible routes
+            temperature: Temperature for responses.  Pass ``None`` to omit
+                ``temperature`` from the request - required for models that
+                reject it (Claude 4.x via Bedrock, OpenAI o1-series).
+                When omitted, resolves from ``SKILL_SCANNER_LLM_TEMPERATURE``
+                (numeric value or ``"none"``).
             max_tokens: Max tokens for responses
             timeout: Request timeout in seconds
 
@@ -91,7 +102,9 @@ class AlignmentLLMClient:
         self._model = model
         self._base_url = base_url
         self._api_version = api_version
-        self._temperature = temperature
+        self._provider = os.getenv("SKILL_SCANNER_LLM_PROVIDER")
+        self._llm_user = resolve_llm_user(llm_user)
+        self._temperature = _resolve_temperature(temperature, "SKILL_SCANNER_LLM_TEMPERATURE", default=0.1)
         self._max_tokens = max_tokens
         self._timeout = timeout
 
@@ -163,11 +176,13 @@ class AlignmentLLMClient:
             try:
                 return await self._make_llm_request(prompt)
             except Exception as e:
+                record_external_error("llm", type(e).__name__, operation="alignment")
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt)
                     self.logger.warning(
                         f"LLM request failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay}s..."
                     )
+                    record_external_retry("llm", "request_failed", operation="alignment")
                     await asyncio.sleep(delay)
                 else:
                     self.logger.error(f"LLM request failed after {max_retries} attempts: {e}")
@@ -203,9 +218,10 @@ class AlignmentLLMClient:
                     {"role": "user", "content": prompt},
                 ],
                 "max_tokens": self._max_tokens,
-                "temperature": self._temperature,
                 "timeout": self._timeout,
             }
+            if self._temperature is not None:
+                request_params["temperature"] = self._temperature
 
             # Add API key if available
             if self._api_key:
@@ -222,8 +238,12 @@ class AlignmentLLMClient:
             if self._api_version:
                 request_params["api_version"] = self._api_version
 
+            if self._llm_user and supports_openai_user_param(self._model, self._provider):
+                request_params["user"] = self._llm_user
+
             self.logger.debug(f"Sending alignment verification request to {self._model}")
-            response = await acompletion(**request_params, drop_params=True)
+            with external_span("llm", "alignment", {"llm.model": str(self._model)}):
+                response = await acompletion(**request_params, drop_params=True)
 
             # Extract content from response
             content = response.choices[0].message.content

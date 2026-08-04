@@ -47,7 +47,7 @@ This will:
 | `llm_model` | string | `""` | LLM model name (maps to `SKILL_SCANNER_LLM_MODEL` env var, e.g. `gpt-4o`) |
 | `use_behavioral` | boolean | `false` | Enable behavioral dataflow analysis |
 | `lenient` | boolean | `false` | Tolerate malformed skills |
-| `extra_args` | string | `""` | Additional CLI flags passed verbatim |
+| `extra_args` | string | `""` | Additional CLI flags from the workflow allowlist |
 
 ## Secrets
 
@@ -56,7 +56,14 @@ All secrets are optional and only needed for advanced analysis features.
 | Secret | Maps to env var | Required for |
 |--------|----------------|--------------|
 | `llm_api_key` | `SKILL_SCANNER_LLM_API_KEY` | `use_llm: true` |
-| `virustotal_api_key` | `VIRUSTOTAL_API_KEY` | `--use-virustotal` (via `extra_args`) |
+| `virustotal_api_key` | `VIRUSTOTAL_API_KEY` | `--use-virustotal` (via validated `extra_args`) |
+
+`extra_args` is intentionally allowlisted because this reusable workflow can run
+with API secrets in the environment. Supported extra flags are additive scanner
+options such as `--use-virustotal`, `--vt-upload-files`, `--use-aidefense`,
+`--use-trigger`, `--enable-meta`, selected LLM tuning flags, custom local rule
+paths, taxonomy paths, and `--rule-packs`. Add new entries only after confirming
+they cannot expose secrets or execute caller-controlled code.
 
 To configure secrets, go to your repository's **Settings > Secrets and variables > Actions** and add them there. They are never exposed in logs.
 

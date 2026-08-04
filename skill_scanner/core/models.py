@@ -84,9 +84,10 @@ class SkillManifest:
         if self.allowed_tools is None:
             self.allowed_tools = []
         elif isinstance(self.allowed_tools, str):
-            # Agent skill docs commonly show comma-separated tool lists in YAML frontmatter
-            # (e.g., "allowed-tools: Read, Grep, Glob"). Treat this as a list.
-            parts = [p.strip() for p in self.allowed_tools.split(",")]
+            # Agent skill docs show comma-separated or space-separated tool lists in YAML frontmatter
+            # (e.g., "allowed-tools: Read, Grep, Glob" or "allowed-tools: Read Grep Glob").
+            sep = "," if "," in self.allowed_tools else None
+            parts = [p.strip() for p in self.allowed_tools.split(sep)]
             self.allowed_tools = [p for p in parts if p]
 
     @property
@@ -217,6 +218,7 @@ class ScanResult:
     analyzability_score: float | None = None
     analyzability_details: dict[str, Any] | None = None
     scan_metadata: dict[str, Any] | None = None
+    llm_usage: dict[str, int] | None = None
 
     @property
     def is_safe(self) -> bool:
@@ -264,6 +266,8 @@ class ScanResult:
         }
         if self.analyzers_failed:
             result["analyzers_failed"] = self.analyzers_failed
+        if self.llm_usage:
+            result["llm_usage"] = self.llm_usage
         return result
 
 

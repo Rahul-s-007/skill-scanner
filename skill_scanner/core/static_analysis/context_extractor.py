@@ -27,6 +27,13 @@ from typing import Any
 
 from .dataflow.forward_analysis import ForwardDataflowAnalysis
 from .parser.python_parser import FunctionInfo, PythonParser
+from .url_classifier import (
+    LEGITIMATE_DOMAINS as _LEGITIMATE_DOMAINS,
+)
+from .url_classifier import (
+    SUSPICIOUS_DOMAINS as _SUSPICIOUS_DOMAINS,
+)
+from .url_classifier import classify_url
 
 
 @dataclass
@@ -55,6 +62,10 @@ class SkillScriptContext:
     all_function_calls: list[str] = field(default_factory=list)
     all_string_literals: list[str] = field(default_factory=list)
     suspicious_urls: list[str] = field(default_factory=list)
+
+    # True if the script-level dataflow analysis stopped early (time/iteration budget),
+    # so the flows below are a sound under-approximation (possible false negatives).
+    dataflow_incomplete: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for LLM prompt."""
@@ -137,118 +148,19 @@ class SkillFunctionContext:
     # Dataflow facts
     dataflow_summary: dict[str, Any] = field(default_factory=dict)
 
+    # True if the parameter-flow analysis stopped early (time budget), so the
+    # parameter_flows above are a sound under-approximation.
+    dataflow_incomplete: bool = False
+
 
 class ContextExtractor:
     """Extract comprehensive security context from skill scripts."""
 
-    # ONLY flag URLs to explicitly suspicious domains - not all unknown URLs
-    # Reference: https://lots-project.com/ (Living Off Trusted Sites)
-    SUSPICIOUS_DOMAINS = [
-        # Known exfil/C2/paste services (LOTS: Download, Exfiltration, C&C)
-        "pastebin.com",
-        "hastebin.com",
-        "paste.ee",
-        "rentry.co",
-        "zerobin.net",
-        "textbin.net",
-        "termbin.com",
-        "sprunge.us",
-        "clbin.com",
-        "ix.io",
-        "pastetext.net",
-        "pastie.org",
-        "ideone.com",
-        # File sharing services (LOTS: Download, Exfiltration)
-        "transfer.sh",
-        "filebin.net",
-        "gofile.io",
-        "anonfiles.com",
-        "mediafire.com",
-        "mega.nz",
-        "wetransfer.com",
-        "filetransfer.io",
-        "ufile.io",
-        "4sync.com",
-        "uplooder.net",
-        "filecloudonline.com",
-        "sendspace.com",
-        "siasky.net",
-        # Tunneling/webhook services (LOTS: C&C, Exfiltration)
-        "webhook.site",
-        "requestbin",
-        "ngrok.io",
-        "pipedream.net",
-        "localhost.run",
-        "trycloudflare.com",
-        # Code execution services (LOTS: C&C, Download)
-        "codepen.io",
-        "repl.co",
-        "glitch.me",
-        # Explicitly malicious example domains
-        "attacker.example.com",
-        "evil.example.com",
-        "malicious.com",
-        "c2-server.com",
-    ]
-
-    # Domains that are always safe (not flagged even if matched by SUSPICIOUS_DOMAINS pattern)
-    # NOTE: We intentionally exclude file-hosting/messaging services that appear in LOTS
-    # (https://lots-project.com/) with Download/C&C capabilities, even if commonly used.
-    LEGITIMATE_DOMAINS = [
-        # AI provider services (API endpoints only, not user content)
-        "api.anthropic.com",
-        "statsig.anthropic.com",
-        "api.openai.com",
-        "api.together.xyz",
-        "api.cohere.ai",
-        "generativelanguage.googleapis.com",
-        # Package registries (read-only, no user-uploaded executables)
-        "registry.npmjs.org",
-        "npmjs.com",
-        "npmjs.org",
-        "yarnpkg.com",
-        "registry.yarnpkg.com",
-        "pypi.org",
-        "files.pythonhosted.org",
-        "pythonhosted.org",
-        "crates.io",
-        "rubygems.org",
-        "pkg.go.dev",
-        # System packages
-        "archive.ubuntu.com",
-        "security.ubuntu.com",
-        "debian.org",
-        # XML schemas (for OOXML document processing)
-        "schemas.microsoft.com",
-        "schemas.openxmlformats.org",
-        "www.w3.org",
-        "purl.org",
-        "json-schema.org",
-        # Localhost and development
-        "localhost",
-        "127.0.0.1",
-        "0.0.0.0",
-        "::1",
-        # Common safe services (API-focused, not file hosting)
-        "stripe.com",
-        "zoom.us",
-        "twilio.com",
-        "mailgun.com",
-        "sentry.io",
-        "datadog.com",
-        "newrelic.com",
-        "elastic.co",
-        "mongodb.com",
-        "redis.io",
-        "postgresql.org",
-        # NOTE: The following are intentionally NOT in this list due to LOTS risk:
-        # - github.com, gitlab.com, bitbucket.org (Download, C&C)
-        # - raw.githubusercontent.com (Download, C&C)
-        # - discord.com, telegram.org, slack.com (C&C, Exfil)
-        # - amazonaws.com, googleapis.com, azure.com, cloudflare.com (wildcard hosting)
-        # - google.com, microsoft.com (too broad, includes file hosting)
-        # - sendgrid.com (email tracking/download)
-    ]
+    # Domain lists and the classification logic now live in the shared
+    # ``url_classifier`` module so every analyzer applies the same rules.
+    # Kept as class attributes for backward compatibility.
+    SUSPICIOUS_DOMAINS = _SUSPICIOUS_DOMAINS
+    LEGITIMATE_DOMAINS = _LEGITIMATE_DOMAINS
 
     def extract_context(self, file_path: Path, source_code: str) -> SkillScriptContext:
         """
@@ -274,14 +186,19 @@ class ContextExtractor:
         has_eval_exec = any(f.has_eval_exec for f in parser.functions)
 
         # Use CFG-based ForwardDataflowAnalysis for script-level source detection and flow tracking
+        dataflow_incomplete = False
         try:
             forward_analyzer = ForwardDataflowAnalysis(parser, parameter_names=[], detect_sources=True)
             script_flows = forward_analyzer.analyze_forward_flows()
+            # Surface a truncated (time/iteration-budgeted) analysis so its
+            # under-approximation is not mistaken for a clean result downstream.
+            dataflow_incomplete = forward_analyzer.analysis_incomplete
         except Exception as e:
             import logging
 
             logging.getLogger(__name__).warning(f"CFG-based script-level analysis failed: {e}")
             script_flows = []
+            dataflow_incomplete = True
 
         # Extract credential/env access from detected sources
         has_credential_access = any(flow.parameter_name.startswith("credential_file:") for flow in script_flows)
@@ -339,17 +256,14 @@ class ContextExtractor:
         suspicious_urls = []
         for s in all_strings:
             # Skip if not URL-like or contains newlines (docstrings)
-            if "\n" in s or not s.startswith("http"):
+            if "\n" in s:
                 continue
             # Skip if too long (likely docstring) or too short
             if len(s) > 200 or len(s) < 10:
                 continue
-            # Skip if contains legitimate domain
-            if any(domain in s for domain in self.LEGITIMATE_DOMAINS):
-                continue
-            # ONLY flag if URL contains a known suspicious domain
-            # Don't flag all unknown URLs - that's too aggressive
-            if any(domain in s for domain in self.SUSPICIOUS_DOMAINS):
+            # ONLY flag if URL contains a known suspicious domain (legitimate
+            # domains take precedence). Don't flag all unknown URLs - too aggressive.
+            if classify_url(s) == "suspicious":
                 suspicious_urls.append(s)
 
         # Create context
@@ -370,6 +284,7 @@ class ContextExtractor:
             all_function_calls=list(set(all_calls)),
             all_string_literals=all_strings,
             suspicious_urls=suspicious_urls,
+            dataflow_incomplete=dataflow_incomplete,
         )
 
         return context
@@ -437,7 +352,7 @@ class ContextExtractor:
         control_flow = self._analyze_control_flow(node)
 
         # Parameter flow analysis
-        parameter_flows = self._analyze_parameter_flows(node, parameters)
+        parameter_flows, dataflow_incomplete = self._analyze_parameter_flows(node, parameters)
 
         # Constants
         constants = self._extract_constants(node)
@@ -488,6 +403,7 @@ class ContextExtractor:
             global_writes=global_writes,
             attribute_access=attribute_access,
             dataflow_summary=dataflow_summary,
+            dataflow_incomplete=dataflow_incomplete,
         )
 
     def _extract_parameters(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[dict[str, Any]]:
@@ -585,17 +501,21 @@ class ContextExtractor:
 
     def _analyze_parameter_flows(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef, parameters: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Analyze how parameters flow through the function using CFG-based analysis.
 
         Uses proper control flow graph and fixpoint analysis for accurate tracking
         through branches, loops, and function calls.
+
+        Returns:
+            (flows, incomplete) where ``incomplete`` is True if the dataflow analysis
+            stopped early on its time budget (flows are then an under-approximation).
         """
         flows: list[dict[str, Any]] = []
         param_names = [p["name"] for p in parameters]
 
         if not param_names:
-            return flows
+            return flows, False
 
         # Extract function source code for parser
         try:
@@ -607,12 +527,12 @@ class ContextExtractor:
             func_source = f"def {node.name}({param_str}):\n    pass"
 
         if not func_source:
-            return flows
+            return flows, False
 
         # Create parser and run CFG-based forward analysis
         parser = PythonParser(func_source)
         if not parser.parse():
-            return flows
+            return flows, False
 
         try:
             forward_analyzer = ForwardDataflowAnalysis(parser, param_names)
@@ -630,14 +550,13 @@ class ContextExtractor:
                         "reaches_external": flow_path.reaches_external,
                     }
                 )
+            return flows, forward_analyzer.analysis_incomplete
         except Exception as e:
             # Log error but return empty flows (no fallback)
             import logging
 
             logging.getLogger(__name__).warning(f"CFG-based parameter flow analysis failed: {e}")
-            return flows
-
-        return flows
+            return flows, True
 
     def _extract_constants(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, Any]:
         """Extract constant values."""

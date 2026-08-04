@@ -273,7 +273,7 @@ See [API Server](../user-guide/api-server.md) and [API Endpoint Reference](../re
 Block risky findings before they reach the repository. The hook scans staged skill changes and fails the commit when findings exceed a severity threshold.
 
 ```bash
-skill-scanner-pre-commit install
+skill-scanner-pre-commit --install
 ```
 
 <details>
@@ -297,13 +297,13 @@ The LLM and Meta analyzers work with multiple LLM providers. Select a provider v
 
 ```bash
 pip install cisco-ai-skill-scanner[bedrock]   # AWS Bedrock (IAM credentials)
-pip install cisco-ai-skill-scanner[vertex]    # Google Vertex AI
+pip install cisco-ai-skill-scanner[vertex]    # Google Vertex AI (Workload Identity or service account)
 pip install cisco-ai-skill-scanner[azure]     # Azure OpenAI (managed identity)
 pip install cisco-ai-skill-scanner[all]       # All cloud providers
 ```
 
 > [!TIP]
-> For consensus-based false-positive reduction, use `--llm-consensus-runs 3` to run the LLM analyzer 3 times independently and keep only majority-agreed findings.
+> For consensus-based false-positive reduction, use `--llm-consensus-runs 3` to run the LLM analyzer 3 times independently and keep only majority-agreed findings. For each retained finding, the highest severity observed across its votes wins. Failed or missing votes remain in the configured-run denominator.
 
 Environment variables for LLM and external analyzer configuration are documented in the [Configuration Reference](../reference/configuration-reference.md). Provider-specific setup is covered in [Dependencies and LLM Providers](../reference/dependencies-and-llm-providers.md).
 
@@ -350,7 +350,7 @@ See [Integrations Guide](../development/integrations.md) for CI/CD setup details
 ## Performance and Practicality
 
 - **Selective analyzer enablement** — only activate what you need. Core analyzers run by default; optional analyzers are opt-in.
-- **LLM consensus mode** — `--llm-consensus-runs N` runs the LLM analyzer N times and keeps only majority-agreed findings, significantly reducing false positives.
+- **LLM consensus mode** — `--llm-consensus-runs N` runs the LLM analyzer N times, keeps only majority-agreed findings, and deterministically retains their highest observed severity. Individual LLM samples remain model-dependent and may vary.
 - **Policy-based suppression** — use `severity_overrides` to reclassify and `disabled_rules` to suppress specific rule IDs, without code changes.
 - **Structured output** — every format is designed for machine consumption and long-term maintainability.
 
